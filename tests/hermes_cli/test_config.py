@@ -73,6 +73,49 @@ class TestLoadConfigDefaults:
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
 
+    def test_default_config_contains_disabled_adaptive_routing(self):
+        adaptive = DEFAULT_CONFIG["adaptive_routing"]
+
+        assert adaptive["enabled"] is False
+        assert adaptive["dry_run"] is False
+        assert adaptive["default_policy"] == "balanced"
+        assert adaptive["models"] == []
+
+    def test_adaptive_routing_delegation_scope_can_default_on_while_disabled(self):
+        adaptive = DEFAULT_CONFIG["adaptive_routing"]
+
+        assert adaptive["enabled"] is False
+        assert adaptive["apply_to"]["delegation"] is True
+        assert adaptive["apply_to"]["cli"] is False
+        assert adaptive["apply_to"]["gateway"] is False
+        assert adaptive["apply_to"]["cron"] is False
+        assert adaptive["apply_to"]["one_shot"] is False
+
+    def test_load_config_preserves_existing_user_config_with_adaptive_defaults(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"provider": "openrouter", "default": "openai/gpt-test"},
+                    "agent": {"max_turns": 42},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+
+        assert config["model"] == {"provider": "openrouter", "default": "openai/gpt-test"}
+        assert config["agent"]["max_turns"] == 42
+        assert config["adaptive_routing"]["enabled"] is False
+        assert config["adaptive_routing"]["apply_to"]["delegation"] is True
+
+    def test_adaptive_routing_is_known_root_key(self):
+        from hermes_cli import config as cfg_mod
+
+        assert "adaptive_routing" in cfg_mod._KNOWN_ROOT_KEYS
+
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config_path = tmp_path / "config.yaml"
