@@ -1,0 +1,13 @@
+name: devops
+description: A template for DevOps projects with Terraform, Docker, and CI/CD pipelines
+category: infrastructure
+version: 1.0.0
+skills:
+  - devops
+  - github-pr-workflow
+context_files:
+  - context/README.md
+toolsets:
+  - terminal
+  - file
+  - github

@@ -1,0 +1,6 @@
+{
+  "name": "devops",
+  "description": "DevOps template with Terraform, Docker, and CI/CD",
+  "version": "1.0.0",
+  "author": "Hermes Agent"
+}
