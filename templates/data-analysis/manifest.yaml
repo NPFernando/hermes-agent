@@ -1,0 +1,13 @@
+name: data-analysis
+description: A template for data analysis projects with Jupyter, pandas, and visualization tools
+category: data
+version: 1.0.0
+skills:
+  - data-science
+  - jupyter-live-kernel
+context_files:
+  - context/README.md
+toolsets:
+  - terminal
+  - file
+  - web
