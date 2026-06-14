@@ -280,6 +280,7 @@ export default function FilesPage() {
       <input
         ref={fileInputRef}
         type="file"
+        accept="image/*;capture=camera"
         multiple
         className="hidden"
         onChange={(event) => void uploadFiles(event.currentTarget.files)}
