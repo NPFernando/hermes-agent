@@ -210,6 +210,21 @@ scripts/run_tests.sh
 - 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Linux desktop-control MCP server for Hermes and other MCP hosts, with AT-SPI accessibility trees, Wayland/X11 input, screenshots, and compositor window targeting.
 - 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
 
+## Development with DevContainer
+
+This repository includes a DevContainer configuration for consistent development environments.
+
+To use:
+1. Open the repository in VS Code.
+2. When prompted, click "Reopen in Container" or use the Command Palette > `Dev Containers: Reopen in Container`.
+3. Alternatively, open in GitHub Codespaces.
+
+The container will:
+- Install Python 3.11 and uv
+- Install Node.js LTS
+- Install Python package dependencies via `uv pip install -e .`
+- Install Node.js dependencies via `npm install`
+- Provide useful VS Code extensions (Python, ESLint, Prettier, etc.)
 ---
 
 ## License
