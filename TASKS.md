@@ -1,5 +1,17 @@
 # Auto-Improvement Tasks
 
-- [x] Add CI validation for DevContainer configuration — selected for this cycle because it is low-effort, high-signal, and directly follows the previous cycle's devcontainer hardening notes.
-- [x] Clean obsolete auto-improvement artifacts from repo root — deferred; needs maintainer intent check before deleting tracked artifacts.
-- [x] Add automated policy review for generated configs — deferred; broader backend change than this cron cycle should ship unattended.
+- [x] Ship adaptive built-in memory decay CLI — selected for this cycle; implementation hardened, tested, committed, pushed, and prepared for PR review.
+- [x] Move auto-improvement artifacts out of repository root — processed as a follow-up idea for a future low-risk cleanup cycle.
+- [x] Add actionlint validation for GitHub Actions workflows — processed as a follow-up idea for a future CI-hardening cycle.
+
+## Selected task
+
+Adaptive built-in memory decay CLI.
+
+## Exit criteria
+
+- [x] Ideas processed in `IDEAS.json`.
+- [x] Plan written in `PLAN.md`.
+- [x] Tests/lint/syntax checks captured in `TEST_REPORT.json`.
+- [ ] Feature branch pushed and PR merged.
+- [ ] Close summary written after review/deployment.

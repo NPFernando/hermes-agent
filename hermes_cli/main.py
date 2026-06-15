@@ -10822,6 +10822,44 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
+    if sub == "decay":
+        import json
+        from tools.memory_decay import evaluate_decay
+
+        result = evaluate_decay(
+            target=getattr(args, "target", "all"),
+            threshold=getattr(args, "threshold", 0.05),
+            remove=getattr(args, "remove", False),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return
+        action = "Pruned" if result["remove"] else "Would prune"
+        print(
+            f"\n  ✓ Memory decay evaluated {result['total']} entries "
+            f"(threshold {result['threshold']})"
+        )
+        print(f"  {action}: {result['forgotten_count']} forgotten entries")
+        print(f"  Metadata: {result['kept_count']} kept, {result['pruned_count']} removed\n")
+        return
+    if sub == "reinforce":
+        from tools.memory_decay import reinforce_memory
+
+        result = reinforce_memory(
+            memory_text=getattr(args, "memory_text", None),
+            memory_hash=getattr(args, "memory_hash", None),
+            target=getattr(args, "target", "all"),
+            increment_days=getattr(args, "increment_days", 7.0),
+        )
+        if result.get("success"):
+            print(
+                f"\n  ✓ Reinforced {result['target']} memory {result['hash'][:12]} "
+                f"(stability {result['stability_days']:.1f} days, "
+                f"recalls {result['recall_count']})\n"
+            )
+        else:
+            print(f"\n  ✗ {result.get('error', 'Failed to reinforce memory')}\n")
+        return
     if sub == "off":
         from hermes_cli.config import load_config, save_config
 

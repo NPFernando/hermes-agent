@@ -1,23 +1,23 @@
 [
   {
-    "title": "Add CI validation for DevContainer configuration",
-    "description": "Run JSON syntax checks, policy guardrails, and a Docker build when .devcontainer files change so developer environment regressions are caught before merge.",
-    "category": "github",
+    "title": "Ship adaptive built-in memory decay CLI",
+    "description": "Complete the existing uncommitted adaptive memory scoring work by adding decay/reinforce commands, metadata stored outside MEMORY.md/USER.md, tests, and CLI verification. This helps keep long-lived Hermes memory useful without mutating prompt-facing memory format.",
+    "category": "memory",
+    "estimated_effort": "medium",
+    "processed": true
+  },
+  {
+    "title": "Move auto-improvement artifacts out of repository root",
+    "description": "Store IDEAS/PLAN/TASKS/TEST reports under a generated reports directory or gitignored workspace path to reduce root clutter and avoid unrelated diffs across improvement cycles.",
+    "category": "workspace",
     "estimated_effort": "low",
     "processed": true
   },
   {
-    "title": "Clean obsolete auto-improvement artifacts from repo root",
-    "description": "Review tracked PLAN/TASKS/TEST_REPORT artifacts and move recurring reports to a dedicated generated-artifacts location if they are not intended source files.",
-    "category": "workspace",
-    "estimated_effort": "medium",
-    "processed": true
-  },
-  {
-    "title": "Add automated policy review for generated configs",
-    "description": "Teach the auto-improvement loop to flag telemetry defaults and outdated schema patterns during planning/review before PR creation.",
-    "category": "backend",
-    "estimated_effort": "medium",
+    "title": "Add actionlint validation for GitHub Actions workflows",
+    "description": "Extend CI validation to parse and lint workflow YAML beyond syntax-only checks, catching invalid action expressions before PRs merge.",
+    "category": "github",
+    "estimated_effort": "low",
     "processed": true
   }
 ]
