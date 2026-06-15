@@ -1,0 +1,60 @@
+name: DevContainer validation
+
+# Validate the development container contract whenever the container inputs
+# change. The DevContainer config is developer-facing infrastructure, so catch
+# JSON regressions and build failures before they land on main.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .devcontainer/**
+      - .github/workflows/devcontainer-validation.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - .devcontainer/**
+      - .github/workflows/devcontainer-validation.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devcontainer-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-config:
+    name: Validate devcontainer.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check JSON syntax
+        run: python -m json.tool .devcontainer/devcontainer.json > /tmp/devcontainer.json
+
+      - name: Verify telemetry stays disabled by default
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path('.devcontainer/devcontainer.json').read_text(encoding='utf-8'))
+          settings = config.get('customizations', {}).get('vscode', {}).get('settings', {})
+          level = settings.get('telemetry.telemetryLevel')
+          if level != 'off':
+              raise SystemExit(f"Expected telemetry.telemetryLevel='off', got {level!r}")
+          PY
+
+  build-image:
+    name: Build DevContainer image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build Dockerfile
+        run: docker build -f .devcontainer/Dockerfile .devcontainer

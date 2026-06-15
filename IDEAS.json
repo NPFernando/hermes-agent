@@ -1,20 +1,23 @@
 [
   {
-    "title": "Project Template System for Workspace",
-    "description": "Add a workspace feature that provides predefined project templates (e.g., web development, data analysis, DevOps) with pre-configured skills, context files, and toolsets. Users can select a template when starting a new project, reducing setup time and ensuring best practices.",
+    "title": "Add CI validation for DevContainer configuration",
+    "description": "Run JSON syntax checks, policy guardrails, and a Docker build when .devcontainer files change so developer environment regressions are caught before merge.",
+    "category": "github",
+    "estimated_effort": "low",
+    "processed": true
+  },
+  {
+    "title": "Clean obsolete auto-improvement artifacts from repo root",
+    "description": "Review tracked PLAN/TASKS/TEST_REPORT artifacts and move recurring reports to a dedicated generated-artifacts location if they are not intended source files.",
     "category": "workspace",
-    "estimated_effort": "medium"
+    "estimated_effort": "medium",
+    "processed": true
   },
   {
-    "title": "Dynamic Personality Blending",
-    "description": "Enable users to blend multiple personalities (e.g., Astra and a custom sister) in real-time to create hybrid agent behaviors. This would involve a weighted combination of personality traits, response styles, and knowledge domains, adjustable via slash commands or settings.",
-    "category": "personality",
-    "estimated_effort": "medium"
-  },
-  {
-    "title": "Predictive Tool Caching and Pre-fetching",
-    "description": "Enhance the backend tool invocation system by caching results of frequent tool calls and implementing a prediction mechanism to pre-fetch likely-needed tools based on conversation context and history, reducing latency and improving agent responsiveness.",
+    "title": "Add automated policy review for generated configs",
+    "description": "Teach the auto-improvement loop to flag telemetry defaults and outdated schema patterns during planning/review before PR creation.",
     "category": "backend",
-    "estimated_effort": "high"
+    "estimated_effort": "medium",
+    "processed": true
   }
 ]
