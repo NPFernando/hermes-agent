@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: hermes-skill-template
+Version: 1.0.0
+Summary: A template for Hermes skills with testing and linting
+Author: Hermes Agent
+Provides-Extra: test
+Requires-Dist: pytest>=7.0; extra == "test"

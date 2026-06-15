@@ -1,0 +1,7 @@
+pyproject.toml
+hermes_skill_template.egg-info/PKG-INFO
+hermes_skill_template.egg-info/SOURCES.txt
+hermes_skill_template.egg-info/dependency_links.txt
+hermes_skill_template.egg-info/requires.txt
+hermes_skill_template.egg-info/top_level.txt
+tests/test_sample_skill.py

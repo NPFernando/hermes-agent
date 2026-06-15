@@ -1,0 +1,11 @@
+name: skill-template
+description: Template for Hermes skills with testing, linting, and documentation.
+category: development
+version: 1.0.0
+skills:
+  - skill-template
+context_files:
+  - context/README.md
+toolsets:
+  - terminal
+  - file

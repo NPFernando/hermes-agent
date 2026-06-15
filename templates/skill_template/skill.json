@@ -1,0 +1,6 @@
+{
+  "name": "skill-template",
+  "description": "A standardized template for creating new Hermes skills with built‑in testing, linting, and documentation examples.",
+  "version": "1.0.0",
+  "author": "Hermes Agent"
+}

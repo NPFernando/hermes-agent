@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-skill-template"
+version = "1.0.0"
+description = "A template for Hermes skills with testing and linting"
+authors = [{name = "Hermes Agent"}]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = "tests"
+addopts = "-v"
