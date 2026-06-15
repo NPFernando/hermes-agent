@@ -220,11 +220,11 @@ To use:
 3. Alternatively, open in GitHub Codespaces.
 
 The container will:
-- Install Python 3.11 and uv
-- Install Node.js LTS
-- Install Python package dependencies via `uv pip install -e .`
+- Install Python 3.11, uv, Node.js LTS, and GitHub CLI
+- Install Python package dependencies via `uv pip install --system -e '.[dev]'`
 - Install Node.js dependencies via `npm install`
-- Provide useful VS Code extensions (Python, ESLint, Prettier, etc.)
+- Provide useful VS Code extensions (Python, Ruff, ESLint, Prettier, etc.)
+- Keep VS Code telemetry disabled inside the container by default
 ---
 
 ## License

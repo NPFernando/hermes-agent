@@ -1,43 +1,37 @@
 {
-  "name": "Hermes Agent DevContainer",
+  "name": "Hermes Agent",
   "build": {
-    "dockerfile": "Dockerfile"
+    "dockerfile": "Dockerfile",
+    "context": "."
   },
-  // Set *default* container specific settings.json values on container create.
-  "settings": {
-    "terminal.integrated.profiles.linux": {
-      "bash": {
-        "path": "/bin/bash"
-      }
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "lts"
     },
-    "terminal.integrated.defaultProfile.linux": "bash",
-    "python.defaultInterpreterPath": "/usr/local/bin/python",
-    "python.analysis.typeCheckingMode": "basic",
-    "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": {
-      "source.organizeImports": true
-    },
-    // Enable telemetry collection for VS Code (optional)
-    "telemetry.enableTelemetry": true
+    "ghcr.io/devcontainers/features/github-cli:1": {}
   },
-  // Add the IDs of extensions you want installed when the container is created.
-  "extensions": [
-    "ms-python.python",
-    "ms-toolsai.jupyter",
-    "eamodio.gitlens",
-    "github.vscode-pull-request-github",
-    "esbenp.prettier-vscode",
-    "dbaeumer.vscode-eslint",
-    "bradlc.vscode-tailwindcss"
-  ],
-  // Use 'forwardPorts' to make a list of ports inside the container available locally.
-  "forwardPorts": [
-    8000,   // Example: Hermes agent API port
-    3000,   // Example: Web UI port
-    8080    // Example: Metrics port
-  ],
-  // Command to run after the container is created and dependencies are installed.
-  "postCreateCommand": "uv pip install -e . && npm install",
-  // Uncomment to connect as root instead of the default vscode user.
-  // "remoteUser": "root"
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.analysis.typeCheckingMode": "basic",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.organizeImports": "explicit"
+        },
+        "telemetry.telemetryLevel": "off"
+      },
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "github.vscode-pull-request-github",
+        "esbenp.prettier-vscode",
+        "dbaeumer.vscode-eslint"
+      ]
+    }
+  },
+  "forwardPorts": [8000, 3000, 8080],
+  "postCreateCommand": "uv pip install --system -e '.[dev]' && npm install",
+  "remoteUser": "vscode"
 }
