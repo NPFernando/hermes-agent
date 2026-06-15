@@ -1,25 +1,33 @@
 {
   "passed": true,
-  "syntax_check": {
-    "passed": true,
-    "files_checked": [
-      "templates/skill_template/scripts/sample_skill.py",
-      "templates/skill_template/scripts/__init__.py",
-      "templates/skill_template/tests/test_sample_skill.py"
-    ]
-  },
-  "linting": {
-    "passed": true,
-    "error_count": 0,
-    "threshold": 5,
-    "files_checked": [
-      "templates/skill_template/scripts/sample_skill.py",
-      "templates/skill_template/scripts/__init__.py",
-      "templates/skill_template/tests/test_sample_skill.py"
-    ]
-  },
-  "test_suite": {
-    "passed": true,
-    "note": "Full test suite skipped due to timeout; fallback to syntax and linting checks."
-  }
+  "syntax_check_passed": true,
+  "lint_error_count": 0,
+  "checks": [
+    {
+      "name": "devcontainer json syntax",
+      "command": "python -m json.tool .devcontainer/devcontainer.json >/tmp/devcontainer.json",
+      "passed": true
+    },
+    {
+      "name": "telemetry default guard",
+      "command": "python inline guard asserting telemetry.telemetryLevel == 'off'",
+      "passed": true
+    },
+    {
+      "name": "workflow yaml parse",
+      "command": "python inline PyYAML parse for .github/workflows/devcontainer-validation.yml",
+      "passed": true
+    },
+    {
+      "name": "devcontainer docker build",
+      "command": "docker build -f .devcontainer/Dockerfile .devcontainer",
+      "passed": true
+    },
+    {
+      "name": "diff whitespace check",
+      "command": "git diff --check",
+      "passed": true
+    }
+  ],
+  "notes": "No Python source changed. actionlint was unavailable locally, so validation used JSON syntax, policy guard, YAML parsing, Docker build, and git diff whitespace checks."
 }
