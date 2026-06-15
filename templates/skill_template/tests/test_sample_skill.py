@@ -13,7 +13,7 @@ def test_skill_manifest_exists():
 def test_skill_json_valid():
     """Validate that skill.json contains required fields."""
     import json
-    with open("skill.json", "r") as f:
+    with open("skill.json", "r", encoding="utf-8") as f:
         data = json.load(f)
 
     required = {"name", "description", "version", "author"}
