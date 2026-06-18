@@ -1485,6 +1485,18 @@ class GatewaySlashCommandsMixin:
                 return "\n".join(p for p in parts if p)
             return str(value)
 
+        def _personality_names(value: str) -> list[str]:
+            normalized = value.replace("+", ",")
+            return [name.strip().lower() for name in normalized.split(",") if name.strip()]
+
+        def _blend_personalities(names: list[str]) -> str:
+            prompts = [_resolve_prompt(personalities[name]) for name in names]
+            return "\n\n".join(
+                f"Personality layer {index}: {name}\n{prompt}"
+                for index, (name, prompt) in enumerate(zip(names, prompts), start=1)
+                if prompt
+            )
+
         if args in {"none", "default", "neutral"}:
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
@@ -1511,6 +1523,22 @@ class GatewaySlashCommandsMixin:
             self._ephemeral_system_prompt = new_prompt
 
             return t("gateway.personality.set_to", name=args)
+
+        elif len(names := _personality_names(args)) > 1 and all(
+            name in personalities for name in names
+        ):
+            new_prompt = _blend_personalities(names)
+
+            try:
+                if "agent" not in config or not isinstance(config.get("agent"), dict):
+                    config["agent"] = {}
+                config["agent"]["system_prompt"] = new_prompt
+                atomic_yaml_write(config_path, config)
+            except Exception as e:
+                return t("gateway.personality.save_failed", error=str(e))
+
+            self._ephemeral_system_prompt = new_prompt
+            return t("gateway.personality.set_to", name="+".join(names))
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
         return t("gateway.personality.unknown", name=args, available=available)

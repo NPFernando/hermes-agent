@@ -56,6 +56,15 @@ class TestCLIPersonalityNone:
             cli._handle_personality_command("/personality helpful")
         assert cli.system_prompt == "You are helpful."
 
+    def test_personality_blend_joins_known_layers(self):
+        cli = self._make_cli()
+        with patch("cli.save_config_value", return_value=True):
+            cli._handle_personality_command("/personality helpful+concise")
+        assert "Personality layer 1: helpful" in cli.system_prompt
+        assert "You are helpful." in cli.system_prompt
+        assert "Personality layer 2: concise" in cli.system_prompt
+        assert "You are concise." in cli.system_prompt
+
     def test_unknown_personality_shows_none_in_available(self, capsys):
         cli = self._make_cli()
         cli._handle_personality_command("/personality nonexistent")
@@ -143,6 +152,28 @@ class TestGatewayPersonalityNone:
             result = await runner._handle_personality_command(event)
 
         assert "none" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_personality_blend_sets_ephemeral_prompt(self, tmp_path):
+        runner = self._make_runner()
+        config_data = {
+            "agent": {
+                "personalities": {
+                    "helpful": "You are helpful.",
+                    "concise": "You are concise.",
+                }
+            }
+        }
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump(config_data))
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            event = self._make_event("helpful+concise")
+            result = await runner._handle_personality_command(event)
+
+        assert "helpful+concise" in result
+        assert "Personality layer 1: helpful" in runner._ephemeral_system_prompt
+        assert "Personality layer 2: concise" in runner._ephemeral_system_prompt
 
     @pytest.mark.asyncio
     async def test_empty_personality_list_uses_profile_display_path(self, tmp_path):
