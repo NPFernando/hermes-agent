@@ -1,0 +1,23 @@
+[flake8]
+# Keep flake8 focused on correctness checks. Style/formatting is handled by ruff.
+select = E9,F63
+max-line-length = 100
+show-source = True
+statistics = True
+exclude =
+    .git,
+    .venv,
+    __pycache__,
+    .pytest_cache,
+    .ruff_cache,
+    build,
+    dist,
+    hermes_agent.egg-info,
+    node_modules,
+    web/node_modules,
+    web/dist,
+    desktop/dist,
+    desktop/node_modules,
+    skills,
+    optional-skills,
+    plugins

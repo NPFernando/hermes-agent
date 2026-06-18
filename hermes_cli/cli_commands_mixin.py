@@ -967,6 +967,18 @@ class CLICommandsMixin:
         """Handle the /personality command to set predefined personalities."""
         from cli import save_config_value
         parts = cmd.split(maxsplit=1)
+
+        def _personality_names(value: str) -> list[str]:
+            normalized = value.replace("+", ",")
+            return [name.strip().lower() for name in normalized.split(",") if name.strip()]
+
+        def _blend_personalities(names: list[str]) -> str:
+            prompts = [self._resolve_personality_prompt(self.personalities[name]) for name in names]
+            return "\n\n".join(
+                f"Personality layer {index}: {name}\n{prompt}"
+                for index, (name, prompt) in enumerate(zip(names, prompts), start=1)
+                if prompt
+            )
         
         if len(parts) > 1:
             # Set personality
@@ -988,6 +1000,17 @@ class CLICommandsMixin:
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
+            elif len(names := _personality_names(personality_name)) > 1 and all(
+                name in self.personalities for name in names
+            ):
+                self.system_prompt = _blend_personalities(names)
+                self.agent = None  # Force re-init
+                blend_name = "+".join(names)
+                if save_config_value("agent.system_prompt", self.system_prompt):
+                    print(f"(^_^)b Personality blend set to '{blend_name}' (saved to config)")
+                else:
+                    print(f"(^_^) Personality blend set to '{blend_name}' (session only)")
+                print(f"  Layers: {', '.join(names)}")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
                 print(f"  Available: none, {', '.join(self.personalities.keys())}")
@@ -1006,7 +1029,7 @@ class CLICommandsMixin:
                     preview = str(prompt)[:50]
                 print(f"  {name:<12} - {preview}")
             print()
-            print("  Usage: /personality <name>")
+            print("  Usage: /personality <name> or /personality <name>+<name>")
             print()
 
     def _handle_cron_command(self, cmd: str):
