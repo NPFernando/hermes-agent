@@ -129,3 +129,13 @@ scripts/out/
 # stores the published notes. They are not a build artifact and must never be
 # committed to the repo root. See the hermes-release skill.
 RELEASE_v*.md
+
+# Auto-improvement loop scratch artifacts. Scheduled self-improvement runs write
+# IDEAS/PLAN/TASKS/TEST reports for a single cycle; those are operational notes,
+# not source artifacts. Store durable summaries under the external reports area
+# (for example /srv/projects/auto-improvement-reports/) instead of the repo root.
+IDEAS.json
+PLAN.md
+TASKS.md
+TEST_REPORT.json
+CLOSE_SUMMARY.md
