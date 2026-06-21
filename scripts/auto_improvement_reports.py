@@ -89,12 +89,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON with the resolved report directory and artifact paths",
+    )
     args = parser.parse_args(argv)
     try:
         report_dir = create_report_artifacts(args.cycle, base_dir=args.base_dir, force=args.force)
     except (FileExistsError, ValueError, OSError) as exc:
         parser.exit(1, f"error: {exc}\n")
-    print(report_dir)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "cycle": args.cycle,
+                    "report_dir": str(report_dir),
+                    "artifacts": {name: str(report_dir / name) for name in ARTIFACTS},
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(report_dir)
     return 0
 
 

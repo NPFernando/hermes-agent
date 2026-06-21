@@ -6,6 +6,10 @@ from pathlib import Path
 
 import pytest
 
+
+def _read_stdout(capsys):
+    return capsys.readouterr().out.strip()
+
 MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "auto_improvement_reports.py"
 spec = importlib.util.spec_from_file_location("auto_improvement_reports", MODULE_PATH)
 assert spec and spec.loader
@@ -49,3 +53,19 @@ def test_force_overwrites_existing_standard_artifacts(tmp_path):
 def test_invalid_cycle_names_are_rejected(tmp_path, cycle):
     with pytest.raises(ValueError):
         mod.create_report_artifacts(cycle, base_dir=tmp_path)
+
+
+def test_cli_json_output_reports_resolved_paths(tmp_path, capsys):
+    assert mod.main(["cycle-json", "--base-dir", str(tmp_path), "--json"]) == 0
+
+    payload = json.loads(_read_stdout(capsys))
+    report_dir = (tmp_path / "cycle-json").resolve()
+    assert payload["cycle"] == "cycle-json"
+    assert payload["report_dir"] == str(report_dir)
+    assert payload["artifacts"] == {name: str(report_dir / name) for name in mod.ARTIFACTS}
+
+
+def test_cli_plain_output_remains_resolved_path(tmp_path, capsys):
+    assert mod.main(["cycle-plain", "--base-dir", str(tmp_path)]) == 0
+
+    assert _read_stdout(capsys) == str((tmp_path / "cycle-plain").resolve())
