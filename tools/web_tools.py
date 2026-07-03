@@ -966,29 +966,31 @@ def check_web_api_key() -> bool:
     registry.
     """
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured and _is_backend_available(configured):
-        return True
+    if configured:
+        # An explicit shared backend is authoritative. Do not silently light up
+        # the web tools through another backend/gateway when the chosen backend
+        # is unavailable — dispatch would still try the configured backend.
+        return _is_backend_available(configured)
+
     # Any built-in backend with credentials present. This is a boolean OR, so
     # unlike _get_backend() the probe order is irrelevant.
     if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
         return True
-    # Any plugin-registered provider the registry considers active for either
-    # capability. Delegating to the registry's own availability-filtered
-    # resolvers keeps a single authority for "is a custom provider usable"
-    # rather than re-implementing the walk here.
-    try:
-        from agent.web_search_registry import (
-            get_active_search_provider,
-            get_active_extract_provider,
-        )
 
-        return (
-            get_active_search_provider() is not None
-            or get_active_extract_provider() is not None
-        )
-    except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
-        logger.debug("web provider registry availability check failed: %s", exc)
-        return False
+    # Any non-legacy plugin-registered provider that is independently
+    # available. Do not use the registry's active-provider resolvers here: they
+    # also return built-in providers such as ddgs, bypassing the patched legacy
+    # probes above and making "no built-in provider" tests/environment checks
+    # report true incorrectly.
+    for provider in _list_registered_web_providers():
+        if provider.name in _LEGACY_WEB_BACKENDS:
+            continue
+        try:
+            if provider.is_available():
+                return True
+        except Exception as exc:  # noqa: BLE001 — a broken provider is skipped
+            logger.debug("web provider %r.is_available() raised: %s", provider.name, exc)
+    return False
 
 
 if __name__ == "__main__":
