@@ -16108,6 +16108,7 @@ def main(
     max_turns: int = None,
     verbose: Optional[bool] = None,
     quiet: bool = False,
+    output_format: str = "text",
     compact: bool = False,
     list_tools: bool = False,
     list_toolsets: bool = False,
@@ -16135,6 +16136,7 @@ def main(
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
         verbose: Enable verbose logging
+        output_format: Quiet single-query output format (text or jsonl)
         compact: Use compact display mode
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
@@ -16506,6 +16508,18 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        if output_format == "jsonl":
+                            print(json.dumps({
+                                "type": "run_started",
+                                "data": {"session_id": cli.session_id},
+                            }, sort_keys=True))
+                            print(json.dumps({
+                                "type": "actual_route",
+                                "data": {
+                                    "provider": getattr(cli.agent, "provider", cli.provider),
+                                    "model": getattr(cli.agent, "model", cli.model),
+                                },
+                            }, sort_keys=True))
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
@@ -16536,8 +16550,25 @@ def main(
                             and (result.get("failed") or result.get("partial"))
                         ):
                             print(f"Error: {result['error']}", file=sys.stderr)
-                        elif response:
+                        elif response and output_format != "jsonl":
                             print(response)
+
+                        if output_format == "jsonl":
+                            print(json.dumps({
+                                "type": "usage",
+                                "data": {
+                                    "input_tokens": getattr(cli.agent, "session_input_tokens", 0) or 0,
+                                    "output_tokens": getattr(cli.agent, "session_output_tokens", 0) or 0,
+                                },
+                            }, sort_keys=True))
+                            print(json.dumps({
+                                "type": "run_failed" if isinstance(result, dict) and result.get("failed") else "run_finished",
+                                "data": {
+                                    "status": "failed" if isinstance(result, dict) and result.get("failed") else "completed",
+                                    "failure_class": result.get("failure_reason") if isinstance(result, dict) else None,
+                                    "content": response,
+                                },
+                            }, sort_keys=True))
 
                         # Kanban goal-loop mode: a worker spawned for a
                         # goal_mode card keeps working in THIS session until an
@@ -16553,7 +16584,8 @@ def main(
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 
                         # Session ID goes to stderr so piped stdout is clean.
-                        print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                        if output_format != "jsonl":
+                            print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
                         # Ensure proper exit code for automation wrappers.
                         #

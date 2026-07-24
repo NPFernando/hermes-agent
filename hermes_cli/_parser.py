@@ -275,6 +275,17 @@ def build_top_level_parser():
         "-q", "--query", help="Single query (non-interactive mode)"
     )
     chat_parser.add_argument(
+        "--query-stdin",
+        action="store_true",
+        help="Read a single non-interactive query from stdin; mutually exclusive with --query",
+    )
+    chat_parser.add_argument(
+        "--output-format",
+        choices=("text", "jsonl"),
+        default="text",
+        help="Output format for quiet single-query mode (default: text)",
+    )
+    chat_parser.add_argument(
         "--image", help="Optional local image path to attach to a single query"
     )
     # `default=argparse.SUPPRESS` on flags that are ALSO declared on the

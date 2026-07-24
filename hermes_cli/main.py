@@ -2438,6 +2438,25 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
+    if getattr(args, "query_stdin", False):
+        if getattr(args, "query", None):
+            print("Error: --query-stdin is mutually exclusive with --query", file=sys.stderr)
+            sys.exit(2)
+        if sys.stdin.isatty():
+            print("Error: --query-stdin requires piped stdin", file=sys.stderr)
+            sys.exit(2)
+        query_from_stdin = sys.stdin.read(100_001)
+        if len(query_from_stdin) > 100_000 or "\x00" in query_from_stdin:
+            print("Error: stdin query must contain no NUL bytes and be at most 100000 characters", file=sys.stderr)
+            sys.exit(2)
+        if not query_from_stdin.strip():
+            print("Error: --query-stdin received an empty query", file=sys.stderr)
+            sys.exit(2)
+        args.query = query_from_stdin
+    if getattr(args, "output_format", "text") == "jsonl" and not getattr(args, "quiet", False):
+        print("Error: --output-format jsonl requires --quiet", file=sys.stderr)
+        sys.exit(2)
+
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):
@@ -2623,6 +2642,7 @@ def cmd_chat(args):
         "skills": getattr(args, "skills", None),
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
+        "output_format": getattr(args, "output_format", "text"),
         "query": args.query,
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
@@ -14069,6 +14089,8 @@ def _set_chat_arg_defaults(args) -> None:
         ("resume", None),
         ("continue_last", None),
         ("worktree", False),
+        ("query_stdin", False),
+        ("output_format", "text"),
     ]:
         if not hasattr(args, attr):
             setattr(args, attr, default)
