@@ -120,6 +120,63 @@ def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     }
 
 
+def _reinforce_memory(content=None, hash_value=None, stability_increase=0.5):
+    """Reinforce a memory score by updating last_retrieved and increasing stability."""
+    if content is None and hash_value is None:
+        return {"success": False, "error": "Either content or hash_value must be provided"}
+
+    if hash_value is None:
+        import hashlib
+        hash_value = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+    # We need to reuse the existing helper functions: load_scores, save_scores, get_hermes_home, time
+    # Since they are defined in the same module, we can import them.
+    from hermes_constants import get_hermes_home
+    from pathlib import Path
+    import json
+    import time
+
+    HERMES_HOME = get_hermes_home()
+    MEMORY_DIR = HERMES_HOME / "memories"
+    SCORES_FILE = HERMES_HOME / "memory-scores.json"
+
+    def load_scores():
+        if not SCORES_FILE.exists():
+            return {}
+        try:
+            with open(SCORES_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+
+    def save_scores(scores):
+        SCORES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SCORES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(scores, f, indent=2)
+
+    if hash_value is None:
+        hash_value = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+    scores = load_scores()
+    if hash_value not in scores:
+        scores[hash_value] = {
+            'last_retrieved': time.time(),
+            'stability': 0.5
+        }
+        initialized = True
+    else:
+        scores[hash_value]['last_retrieved'] = time.time()
+        scores[hash_value]['stability'] += stability_increase
+        initialized = False
+
+    save_scores(scores)
+
+    if initialized:
+        return {"success": True, "message": f"Initialized memory {hash_value[:8]} with stability 0.5"}
+    else:
+        return {"success": True, "message": f"Reinforced memory {hash_value[:8]}: stability increased to {scores[hash_value]['stability']:.2f}"}
+
+
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -1038,6 +1095,12 @@ def memory_tool(
     elif action == "remove":
         result = store.remove(target, old_text)
 
+    elif action == "reinforce":
+        if not content:
+            return tool_error("Content is required for 'reinforce' action.", success=False)
+        # Reinforce the memory by updating its score in the scoring database
+        result = _reinforce_memory(content=content)
+        return json.dumps(result, ensure_ascii=False)
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
@@ -1100,7 +1163,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "reinforce"],
                 "description": "The action to perform (single-op shape). Omit when using 'operations'."
             },
             "target": {
