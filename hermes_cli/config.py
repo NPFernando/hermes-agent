@@ -1398,6 +1398,15 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        "progress_notices": False,    # opt-in (#52995): when True, routine compression
+                                      # progress statuses (compacting/preflight/pre-API/
+                                      # idle/retry) are delivered to chat gateway
+                                      # platforms instead of being suppressed by the
+                                      # gateway noise filter. Default False keeps
+                                      # routine compression silent-by-design on chat
+                                      # surfaces (server-side logging only). Failure
+                                      # notices and manual /compress feedback are
+                                      # always visible regardless of this setting.
         "threshold": 0.50,            # compress when context usage exceeds this ratio.
                                       # Models with context windows below 512K are
                                       # floored at 0.75 (raise-only) so compaction
@@ -2431,6 +2440,16 @@ DEFAULT_CONFIG = {
         # override the output directory.
         "save_traces": False,
         "trace_dir": "",
+        # Privacy redaction filter for advisor (reference) outputs. Advisors
+        # can echo PII from the conversation (emails, formatted phone numbers)
+        # and credential shapes into reference blocks, traces, and the
+        # aggregator prompt. Modes ('' = off, the default):
+        #   "display" — redact user-visible surfaces only (reference blocks
+        #               shown in the UI + saved MoA trace records); the
+        #               aggregator still sees raw advisor text.
+        #   "full"    — additionally redact the advisor text injected into
+        #               the aggregator prompt (issue #59959).
+        "privacy_filter": "",
         "presets": {
             "default": {
                 "reference_models": [
