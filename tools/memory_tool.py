@@ -1189,7 +1189,7 @@ MEMORY_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+                        "action": {"type": "string", "enum": ["add", "replace", "remove", "reinforce"]},
                         "content": {"type": "string", "description": "Entry content for add/replace."},
                         "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
                     },
