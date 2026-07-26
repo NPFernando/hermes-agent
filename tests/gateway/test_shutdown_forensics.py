@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -248,3 +249,37 @@ class TestCheckSystemdTimingAlignment:
         # for whatever unit pytest IS in.  Both are valid; we just ensure
         # the function doesn't raise.
         assert result is None or isinstance(result, dict)
+
+    def test_system_service_ignores_user_manager_default_timeout(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/self/cgroup":
+                from io import StringIO
+
+                return StringIO("0::/system.slice/hermes-gateway.service\n")
+            return real_open(path, *args, **kwargs)
+
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if "--user" in command:
+                output = "LoadState=not-found\nTimeoutStopUSec=1min 30s\n"
+            else:
+                output = "LoadState=loaded\nTimeoutStopUSec=3min 30s\n"
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        result = sf.check_systemd_timing_alignment(180.0)
+
+        assert result is not None
+        assert result["unit"] == "hermes-gateway.service"
+        assert result["timeout_stop_sec"] == 210.0
+        assert result["mismatch"] is False
+        assert "--user" not in calls[0]
