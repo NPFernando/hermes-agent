@@ -2757,6 +2757,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
 
     path_entries = _build_service_path_dirs()
+    resolved_node_dir: str | None = None
     resolved_node = shutil.which("node")
     if resolved_node:
         # Use the directory where ``node`` is *found on PATH*, NOT the
@@ -2803,10 +2804,26 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
         venv_dir = _remap_path_for_user(venv_dir, home_dir)
         path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
+        # `shutil.which("node")` above reflects the invoking account. Under
+        # `sudo hermes ... --system` that may resolve `/usr/bin/node`, while a
+        # status check run as the target user resolves `~/.local/bin/node`.
+        # Prefer the target user's executable when present so unit generation
+        # is stable across privileged install/restart and unprivileged status.
+        target_local_node_dir = Path(home_dir) / ".local" / "bin"
+        target_local_node = target_local_node_dir / "node"
+        if target_local_node.is_file():
+            if resolved_node_dir in path_entries:
+                path_entries.remove(resolved_node_dir)
+            target_local_node_dir_str = str(target_local_node_dir)
+            if target_local_node_dir_str not in path_entries:
+                path_entries.append(target_local_node_dir_str)
         path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
         path_entries.extend(_build_wsl_interop_paths(path_entries))
         path_entries.extend(common_bin_paths)
-        sane_path = ":".join(path_entries)
+        # resolved_node may already live in a common directory (for example
+        # /usr/bin under sudo). Preserve first occurrence order while removing
+        # duplicates so privileged and unprivileged generation converge.
+        sane_path = ":".join(dict.fromkeys(path_entries))
         return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
@@ -2849,7 +2866,7 @@ WantedBy=multi-user.target
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
     path_entries.extend(common_bin_paths)
-    sane_path = ":".join(path_entries)
+    sane_path = ":".join(dict.fromkeys(path_entries))
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target

@@ -28,3 +28,17 @@ def test_service_path_includes_hermes_home_node_modules(tmp_path):
     with patch("hermes_cli.gateway.get_hermes_home", return_value=tmp_path / ".hermes"):
         dirs = _build_service_path_dirs(project_root=tmp_path)
     assert str(hermes_nm) in dirs
+
+
+def test_generated_service_path_deduplicates_resolved_node_directory():
+    """A node binary from a common bin dir must not make the unit perpetually stale."""
+    from hermes_cli import gateway as gw
+
+    with patch.object(gw.shutil, "which", return_value="/usr/bin/node"):
+        unit = gw.generate_systemd_unit(system=False)
+
+    path_line = next(
+        line for line in unit.splitlines() if line.startswith('Environment="PATH=')
+    )
+    entries = path_line.removeprefix('Environment="PATH=').removesuffix('"').split(":")
+    assert len(entries) == len(set(entries))
