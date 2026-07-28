@@ -934,6 +934,11 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Optional live routing hook (hermes_cli/harp_routing.py). Disabled by
+    # default — an operator must explicitly opt in after observing shadow
+    # decisions. See docs/hermes-agent-live-integration-scoping.md in the
+    # universal-harp-engine repo.
+    "harp_routing": {"enabled": False},
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.

@@ -4384,6 +4384,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
+        if not override:
+            # Optional live routing hook — disabled by default
+            # (harp_routing.enabled: false). Never overrides an explicit
+            # session /model override (that branch already returned above).
+            # Fails open on any error: falls straight through to the
+            # existing static-config resolution below, unchanged.
+            try:
+                from hermes_cli.harp_routing import select_route
+
+                harp_route = select_route(getattr(self, "config", None))
+            except Exception:
+                harp_route = None
+            if harp_route:
+                try:
+                    harp_runtime = _resolve_runtime_agent_kwargs_for_provider(harp_route["provider"])
+                except Exception:
+                    harp_runtime = None
+                if harp_runtime and harp_runtime.get("api_key"):
+                    if harp_runtime.get("credential_pool") is None:
+                        harp_runtime["credential_pool"] = _credential_pool_for_provider(
+                            harp_route["provider"]
+                        )
+                    logger.debug(
+                        "harp_routing selected model: session=%s config_model=%s -> harp_model=%s provider=%s",
+                        resolved_session_key or "", model, harp_route["model"],
+                        harp_route["provider"],
+                    )
+                    return harp_route["model"], harp_runtime
+
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
