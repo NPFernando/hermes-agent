@@ -4391,9 +4391,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Fails open on any error: falls straight through to the
             # existing static-config resolution below, unchanged.
             try:
+                from hermes_cli.config import load_config_readonly
                 from hermes_cli.harp_routing import select_route
 
-                harp_route = select_route(getattr(self, "config", None))
+                harp_route = select_route(load_config_readonly())
             except Exception:
                 harp_route = None
             if harp_route:
