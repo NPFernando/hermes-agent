@@ -4406,7 +4406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         harp_runtime["credential_pool"] = _credential_pool_for_provider(
                             harp_route["provider"]
                         )
-                    logger.debug(
+                    logger.info(
                         "harp_routing selected model: session=%s config_model=%s -> harp_model=%s provider=%s",
                         resolved_session_key or "", model, harp_route["model"],
                         harp_route["provider"],
