@@ -4332,12 +4332,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        message_text: Optional[str] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` →
         global config/env (``_resolve_gateway_model(user_config)`` and default
         provider resolution).
+
+        ``message_text``: optional, only passed by the primary interactive
+        turn handler (``_run_agent_inner``) — used by the optional
+        harp_routing hook below for heuristic task classification
+        (``hermes_cli.harp_routing.classify_task``). The other ~6 call sites
+        of this method don't pass it, and the hook falls back to its
+        existing conservative "text_summary" default when it's None —
+        unchanged behavior for all of them.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -4393,13 +4402,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _harp_was_enabled = False
             try:
                 from hermes_cli.config import load_config_readonly
-                from hermes_cli.harp_routing import is_enabled, risk_for_chat_type, select_route
+                from hermes_cli.harp_routing import classify_task, is_enabled, risk_for_chat_type, select_route
 
                 _harp_cfg = load_config_readonly()
                 _harp_was_enabled = is_enabled(_harp_cfg)
                 _harp_chat_type = getattr(source, "chat_type", None) if source is not None else None
                 harp_route = (
-                    select_route(_harp_cfg, risk=risk_for_chat_type(_harp_chat_type))
+                    select_route(
+                        _harp_cfg,
+                        task=classify_task(message_text),
+                        risk=risk_for_chat_type(_harp_chat_type),
+                    )
                     if _harp_was_enabled else None
                 )
             except Exception as _harp_exc:
@@ -21061,6 +21074,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    message_text=message,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",

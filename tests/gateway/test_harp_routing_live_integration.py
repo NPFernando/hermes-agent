@@ -102,6 +102,61 @@ harp_routing:
     assert runtime_kwargs["provider"] == "openrouter"
 
 
+def test_message_text_flows_through_to_task_classification(tmp_path, monkeypatch):
+    """message_text=None (the 6 other call sites) must classify as
+    text_summary; a real message must reach classify_task() and produce a
+    different task_family — proves the wiring actually works end-to-end,
+    not just that the parameter exists."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model:
+  default: gpt-5.6-terra
+  provider: openai-codex
+harp_routing:
+  enabled: true
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    import hermes_cli.harp_routing as harp_routing
+
+    seen_tasks = []
+
+    def fake_select_route(config, *, task="text_summary", risk="standard", **kwargs):
+        seen_tasks.append(task)
+        return {"model": "nemotron-free-test", "provider": "openrouter"}
+
+    monkeypatch.setattr(harp_routing, "select_route", fake_select_route)
+
+    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None, target_model=None):
+        return {
+            "api_key": "sk-openrouter-test", "base_url": "https://openrouter.ai/api/v1",
+            "provider": "openrouter", "requested_provider": "openrouter",
+            "api_mode": "chat_completions", "command": None, "args": [], "credential_pool": None,
+        }
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
+
+    runner = _make_runner()
+    runner._resolve_session_agent_runtime(
+        session_key="agent:main:telegram:dm:1",
+        user_config={"model": {"default": "gpt-5.6-terra", "provider": "openai-codex"}},
+    )
+    runner._session_model_overrides.clear()
+    runner._resolve_session_agent_runtime(
+        session_key="agent:main:telegram:dm:2",
+        user_config={"model": {"default": "gpt-5.6-terra", "provider": "openai-codex"}},
+        message_text="I'm getting a traceback, can you help fix this bug?",
+    )
+
+    assert seen_tasks == ["text_summary", "debugging"]
+
+
 def test_harp_routing_falls_through_when_disabled(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

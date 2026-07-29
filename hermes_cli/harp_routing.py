@@ -15,6 +15,7 @@ sets across two independently-versioned repos.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import threading
 import time
@@ -70,6 +71,38 @@ def risk_for_chat_type(chat_type: str | None) -> str:
     already-approved risk tier for the canary gate.
     """
     return "standard" if (chat_type or "dm") == "dm" else "low"
+
+
+_TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("security_review", re.compile(r"\b(security review|vulnerabilit(y|ies)|exploit|cve-\d|pen ?test)\b", re.I)),
+    ("audit", re.compile(r"\baudit\b", re.I)),
+    ("debugging", re.compile(
+        r"\b(traceback|stack ?trace|exception|crash(ed|ing)?|doesn'?t work|not working|"
+        r"broken|fails?( to|ing)?|fix (this|the) (bug|error|issue)|bugs?\b)\b", re.I)),
+    ("code_review", re.compile(r"\b(code review|review (this|my|the) (pr|code|diff|patch)|pull request)\b", re.I)),
+    ("documentation", re.compile(r"\b(write (docs|documentation)|docstring|readme|document this)\b", re.I)),
+    ("structured_output", re.compile(r"\b(as json|as yaml|as csv|in json format|in table format|structured output)\b", re.I)),
+    ("code_generation", re.compile(
+        r"\b(write a function|implement|create a script|build a|add a feature|refactor)\b", re.I)),
+]
+
+
+def classify_task(message_text: str | None) -> str:
+    """Heuristic, keyword-based task_family guess from message content.
+
+    Approximate by design — no ML/LLM call, purely local regex matching, so
+    it's free and adds no latency. Checked in priority order (most specific
+    first) so overlapping keywords (e.g. "review this bug") land on the more
+    actionable category. Falls back to ``"text_summary"`` — the same
+    conservative default used everywhere else in this hook — when nothing
+    matches or ``message_text`` is empty/None.
+    """
+    if not message_text:
+        return "text_summary"
+    for task, pattern in _TASK_PATTERNS:
+        if pattern.search(message_text):
+            return task
+    return "text_summary"
 
 
 def select_route(

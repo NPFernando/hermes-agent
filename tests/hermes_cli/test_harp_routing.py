@@ -11,6 +11,51 @@ def test_risk_for_chat_type():
     assert harp_routing.risk_for_chat_type("thread") == "low"
 
 
+def test_classify_task_empty_or_none_falls_back_to_text_summary():
+    assert harp_routing.classify_task(None) == "text_summary"
+    assert harp_routing.classify_task("") == "text_summary"
+    assert harp_routing.classify_task("hey how's it going?") == "text_summary"
+
+
+def test_classify_task_debugging():
+    assert harp_routing.classify_task("I'm getting a traceback when I run this") == "debugging"
+    assert harp_routing.classify_task("the script crashed with a stack trace") == "debugging"
+    assert harp_routing.classify_task("this doesn't work, can you fix the bug?") == "debugging"
+
+
+def test_classify_task_code_review():
+    assert harp_routing.classify_task("can you do a code review on this PR?") == "code_review"
+    assert harp_routing.classify_task("please review my diff") == "code_review"
+
+
+def test_classify_task_code_generation():
+    assert harp_routing.classify_task("write a function that sorts a list") == "code_generation"
+    assert harp_routing.classify_task("implement a new caching layer") == "code_generation"
+    assert harp_routing.classify_task("can you refactor this module?") == "code_generation"
+
+
+def test_classify_task_documentation():
+    assert harp_routing.classify_task("write docs for this API") == "documentation"
+    assert harp_routing.classify_task("add a docstring to this function") == "documentation"
+
+
+def test_classify_task_structured_output():
+    assert harp_routing.classify_task("give me this data as json") == "structured_output"
+    assert harp_routing.classify_task("format the output in table format") == "structured_output"
+
+
+def test_classify_task_security_and_audit():
+    assert harp_routing.classify_task("do a security review of this endpoint") == "security_review"
+    assert harp_routing.classify_task("check for vulnerabilities in this code") == "security_review"
+    assert harp_routing.classify_task("audit our access controls") == "audit"
+
+
+def test_classify_task_priority_order_overlap():
+    # "review this bug" should land on debugging (more actionable), not code_review,
+    # per the documented priority order (debugging is checked before code_review).
+    assert harp_routing.classify_task("can you review this bug in my code?") == "debugging"
+
+
 def test_disabled_by_default_returns_none():
     assert harp_routing.select_route({}) is None
     assert harp_routing.select_route(None) is None
