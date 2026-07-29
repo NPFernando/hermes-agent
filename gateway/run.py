@@ -4390,13 +4390,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session /model override (that branch already returned above).
             # Fails open on any error: falls straight through to the
             # existing static-config resolution below, unchanged.
+            _harp_was_enabled = False
             try:
                 from hermes_cli.config import load_config_readonly
-                from hermes_cli.harp_routing import select_route
+                from hermes_cli.harp_routing import is_enabled, select_route
 
-                harp_route = select_route(load_config_readonly())
-            except Exception:
+                _harp_cfg = load_config_readonly()
+                _harp_was_enabled = is_enabled(_harp_cfg)
+                harp_route = select_route(_harp_cfg) if _harp_was_enabled else None
+            except Exception as _harp_exc:
                 harp_route = None
+                if _harp_was_enabled:
+                    logger.warning("harp_routing raised while enabled: %r", _harp_exc)
+            else:
+                if _harp_was_enabled and not harp_route:
+                    logger.warning(
+                        "harp_routing enabled but returned no route (selector unavailable, "
+                        "timed out, or produced unparseable output) — falling through to "
+                        "static config for session=%s",
+                        resolved_session_key or "",
+                    )
             if harp_route:
                 try:
                     harp_runtime = _resolve_runtime_agent_kwargs_for_provider(harp_route["provider"])
