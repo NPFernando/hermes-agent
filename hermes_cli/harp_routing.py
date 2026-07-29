@@ -47,6 +47,19 @@ def _parse_selector_output(text: str) -> dict[str, str] | None:
     return {"model": model, "provider": provider}
 
 
+def risk_for_chat_type(chat_type: str | None) -> str:
+    """Coarse risk hint from the chat type alone (no message content available
+    at the call site yet — see docs/hermes-agent-live-integration-scoping.md's
+    "known limitation" note in the universal-harp-engine repo).
+
+    A direct 1:1 DM defaults to ``standard`` (unchanged prior behavior). Any
+    group/topic chat defaults to ``low`` — casual group discussion is
+    presumed lower-stakes than a direct request, and ``low`` is a valid,
+    already-approved risk tier for the canary gate.
+    """
+    return "standard" if (chat_type or "dm") == "dm" else "low"
+
+
 def select_route(
     config: dict[str, Any] | None,
     *,
@@ -56,9 +69,12 @@ def select_route(
 ) -> dict[str, str] | None:
     """Return ``{"model": ..., "provider": ...}`` or ``None`` (fail open).
 
-    ``task``/``risk`` default to the conservative pair already listed as
-    ``approved_families``/lowest risk tier in the canary-readiness gate — this
-    hook does not attempt per-conversation task classification yet.
+    ``task`` defaults to the conservative choice already listed in
+    ``approved_families`` for the canary-readiness gate — this hook does not
+    attempt per-conversation task classification yet (no message content is
+    available at the call site). ``risk`` defaults to ``"standard"`` here,
+    but callers with a chat-type signal should pass ``risk_for_chat_type(...)``
+    instead — see ``gateway/run.py``'s ``_resolve_session_agent_runtime``.
     """
     if not is_enabled(config):
         return None

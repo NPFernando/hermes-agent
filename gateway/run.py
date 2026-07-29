@@ -4393,11 +4393,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _harp_was_enabled = False
             try:
                 from hermes_cli.config import load_config_readonly
-                from hermes_cli.harp_routing import is_enabled, select_route
+                from hermes_cli.harp_routing import is_enabled, risk_for_chat_type, select_route
 
                 _harp_cfg = load_config_readonly()
                 _harp_was_enabled = is_enabled(_harp_cfg)
-                harp_route = select_route(_harp_cfg) if _harp_was_enabled else None
+                _harp_chat_type = getattr(source, "chat_type", None) if source is not None else None
+                harp_route = (
+                    select_route(_harp_cfg, risk=risk_for_chat_type(_harp_chat_type))
+                    if _harp_was_enabled else None
+                )
             except Exception as _harp_exc:
                 harp_route = None
                 if _harp_was_enabled:

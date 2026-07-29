@@ -3,6 +3,14 @@ import subprocess
 from hermes_cli import harp_routing
 
 
+def test_risk_for_chat_type():
+    assert harp_routing.risk_for_chat_type("dm") == "standard"
+    assert harp_routing.risk_for_chat_type(None) == "standard"
+    assert harp_routing.risk_for_chat_type("group") == "low"
+    assert harp_routing.risk_for_chat_type("channel") == "low"
+    assert harp_routing.risk_for_chat_type("thread") == "low"
+
+
 def test_disabled_by_default_returns_none():
     assert harp_routing.select_route({}) is None
     assert harp_routing.select_route(None) is None
