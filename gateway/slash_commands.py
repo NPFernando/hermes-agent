@@ -661,6 +661,27 @@ class GatewaySlashCommandsMixin:
         ])
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
+        try:
+            from hermes_cli.harp_routing import risk_for_chat_type, status_summary
+
+            harp_cfg = user_config if user_config else _load_gateway_config()
+            harp_status = status_summary(
+                harp_cfg, risk=risk_for_chat_type(getattr(source, "chat_type", None)),
+            )
+        except Exception:
+            harp_status = {"enabled": False}
+        if harp_status.get("enabled"):
+            decision = harp_status.get("decision")
+            if decision:
+                lines.append(t(
+                    "gateway.status.harp_routing_on",
+                    model=decision.get("model", ""), provider=decision.get("provider", ""),
+                    age=harp_status.get("age_seconds", "?"),
+                ))
+            else:
+                lines.append(t("gateway.status.harp_routing_on_idle"))
+        else:
+            lines.append(t("gateway.status.harp_routing_off"))
         if source.platform == Platform.MATRIX:
             adapter = self.adapters.get(Platform.MATRIX)
             scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))

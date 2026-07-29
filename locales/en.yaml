@@ -315,6 +315,9 @@ gateway:
     state_yes:             "Yes ⚡"
     state_no:              "No"
     queued:                "**Queued follow-ups:** {count}"
+    harp_routing_off:      "**HARP routing:** disabled"
+    harp_routing_on_idle:  "**HARP routing:** enabled (no recent decision cached)"
+    harp_routing_on:       "**HARP routing:** enabled — last: `{model}` ({provider}), {age}s ago"
     platforms:             "**Connected Platforms:** {platforms}"
 
   stop:

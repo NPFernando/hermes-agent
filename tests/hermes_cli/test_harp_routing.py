@@ -117,6 +117,38 @@ def test_cache_expires_after_ttl(monkeypatch, tmp_path):
     assert call_count["n"] == 2, "cache_ttl_seconds: 0 should disable caching entirely"
 
 
+def test_status_summary_disabled():
+    assert harp_routing.status_summary({}) == {"enabled": False, "decision": None, "age_seconds": None}
+
+
+def test_status_summary_enabled_no_cache_yet(tmp_path):
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+    result = harp_routing.status_summary(config, selector_path=selector)
+    assert result == {"enabled": True, "decision": None, "age_seconds": None}
+
+
+def test_status_summary_reflects_cached_decision(monkeypatch, tmp_path):
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="MODEL: nemotron-free\nPROVIDER: openrouter\n", stderr="",
+        )
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", fake_run)
+    harp_routing.select_route(config, selector_path=selector)  # populate cache
+
+    status = harp_routing.status_summary(config, selector_path=selector)
+    assert status["enabled"] is True
+    assert status["decision"] == {"model": "nemotron-free", "provider": "openrouter"}
+    assert status["age_seconds"] is not None and status["age_seconds"] >= 0
+
+
 def test_failure_is_also_cached(monkeypatch, tmp_path):
     config = {"harp_routing": {"enabled": True}}
     selector = tmp_path / "harp-select-route.py"

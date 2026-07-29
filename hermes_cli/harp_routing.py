@@ -133,3 +133,29 @@ def select_route(
             _cache[cache_key] = (now, result)
 
     return result
+
+
+def status_summary(
+    config: dict[str, Any] | None,
+    *,
+    task: str = "text_summary",
+    risk: str = "standard",
+    selector_path: Path | None = None,
+) -> dict[str, Any]:
+    """Read-only status for display (e.g. ``/status``) — never calls the
+    selector itself, only reports the enabled flag and whatever the existing
+    cache already holds for this (task, risk) pair.
+    """
+    enabled = is_enabled(config)
+    if not enabled:
+        return {"enabled": False, "decision": None, "age_seconds": None}
+
+    harp_cfg = _harp_routing_config(config)
+    selector = selector_path or harp_cfg.get("selector_path") or DEFAULT_SELECTOR
+    cache_key = (str(Path(selector)), task, risk)
+    with _cache_lock:
+        cached = _cache.get(cache_key)
+    if cached is None:
+        return {"enabled": True, "decision": None, "age_seconds": None}
+    timestamp, decision = cached
+    return {"enabled": True, "decision": decision, "age_seconds": round(time.monotonic() - timestamp, 1)}
