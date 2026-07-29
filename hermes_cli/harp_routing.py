@@ -16,11 +16,23 @@ sets across two independently-versioned repos.
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 DEFAULT_SELECTOR = Path.home() / "workspace" / "labs" / "universal-harp-engine" / "scripts" / "harp-select-route.py"
 SUBPROCESS_TIMEOUT_SECONDS = 5
+DEFAULT_CACHE_TTL_SECONDS = 60
+
+# In-process cache of recent decisions, keyed by (selector path, task, risk).
+# The routing decision is a pure function of current live conditions (rate
+# limits, model availability) for a given task/risk pair — a fresh subprocess
+# per message is unnecessary overhead on fast back-and-forth conversations.
+# Failures are cached too (short TTL), so a genuinely-down selector doesn't
+# spawn a subprocess (and log a warning) on every single message.
+_cache_lock = threading.Lock()
+_cache: dict[tuple[str, str, str], tuple[float, dict[str, str] | None]] = {}
 
 
 def _harp_routing_config(config: dict[str, Any] | None) -> dict[str, Any]:
@@ -75,14 +87,33 @@ def select_route(
     available at the call site). ``risk`` defaults to ``"standard"`` here,
     but callers with a chat-type signal should pass ``risk_for_chat_type(...)``
     instead — see ``gateway/run.py``'s ``_resolve_session_agent_runtime``.
+
+    Cached briefly per (selector, task, risk) — see ``DEFAULT_CACHE_TTL_SECONDS``
+    / ``harp_routing.cache_ttl_seconds`` in config.yaml. Set the config key to
+    ``0`` to disable caching entirely.
     """
     if not is_enabled(config):
         return None
 
-    selector = selector_path or _harp_routing_config(config).get("selector_path") or DEFAULT_SELECTOR
+    harp_cfg = _harp_routing_config(config)
+    selector = selector_path or harp_cfg.get("selector_path") or DEFAULT_SELECTOR
     selector = Path(selector)
     if not selector.is_file():
         return None
+
+    ttl = harp_cfg.get("cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS)
+    try:
+        ttl = float(ttl)
+    except (TypeError, ValueError):
+        ttl = DEFAULT_CACHE_TTL_SECONDS
+
+    cache_key = (str(selector), task, risk)
+    now = time.monotonic()
+    if ttl > 0:
+        with _cache_lock:
+            cached = _cache.get(cache_key)
+        if cached is not None and (now - cached[0]) < ttl:
+            return cached[1]
 
     try:
         completed = subprocess.run(
@@ -93,9 +124,12 @@ def select_route(
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        result = None
+    else:
+        result = _parse_selector_output(completed.stdout) if completed.returncode == 0 else None
 
-    if completed.returncode != 0:
-        return None
+    if ttl > 0:
+        with _cache_lock:
+            _cache[cache_key] = (now, result)
 
-    return _parse_selector_output(completed.stdout)
+    return result
