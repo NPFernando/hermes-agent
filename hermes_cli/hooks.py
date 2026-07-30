@@ -368,22 +368,81 @@ def _cmd_doctor(_args) -> None:
 
     specs = shell_hooks.iter_configured_hooks(load_config())
 
+    problems = 0
     if not specs:
         print("No shell hooks configured — nothing to check.")
-        return
+    else:
+        print(f"Checking {len(specs)} configured shell hook(s)...\n")
+        for spec in specs:
+            print(f"  [{spec.event}] {spec.command}")
+            problems += _doctor_one(spec, shell_hooks)
+            print()
 
-    print(f"Checking {len(specs)} configured shell hook(s)...\n")
-
-    problems = 0
-    for spec in specs:
-        print(f"  [{spec.event}] {spec.command}")
-        problems += _doctor_one(spec, shell_hooks)
-        print()
+    problems += _doctor_gateway_hooks()
 
     if problems:
         print(f"{problems} issue(s) found.  Fix before relying on these hooks.")
     else:
-        print("All shell hooks look healthy.")
+        print("All hooks look healthy.")
+
+
+def _doctor_gateway_hooks() -> int:
+    """Health-check the directory-based Python gateway hooks
+    (~/.hermes/hooks/*/HOOK.yaml), the counterpart to _doctor_one() for
+    shell hooks. Deliberately does NOT invoke handle() -- that would fire
+    real side effects (DB writes, API calls) from a diagnostic command.
+    It does import the module, same as gateway/hooks.py's real loader does
+    at every gateway startup, so an import-time error surfaces here too;
+    that's the same trust boundary the gateway already crosses on boot,
+    not a new one introduced by this check.
+    """
+    import importlib.util
+    import sys
+
+    gateway_hooks = _list_gateway_hooks()
+    if not gateway_hooks:
+        return 0
+
+    print(f"Checking {len(gateway_hooks)} gateway lifecycle hook(s)...\n")
+
+    from hermes_cli.config import get_hermes_home
+
+    hooks_dir = get_hermes_home() / "hooks"
+    problems = 0
+    for hook in gateway_hooks:
+        hook_dir = hooks_dir / hook["name"]
+        print(f"  [{', '.join(hook['events']) or '(no events)'}] {hook['name']}")
+
+        if not hook["events"]:
+            problems += 1
+            print("      ✗ no events declared in HOOK.yaml — will never fire")
+
+        handler_path = hook_dir / "handler.py"
+        module_name = f"hermes_hook_doctor_{hook['name']}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, handler_path)
+            if spec is None or spec.loader is None:
+                problems += 1
+                print("      ✗ could not build an import spec for handler.py")
+            else:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                try:
+                    spec.loader.exec_module(module)
+                finally:
+                    sys.modules.pop(module_name, None)
+                handle = getattr(module, "handle", None)
+                if handle is None:
+                    problems += 1
+                    print("      ✗ handler.py has no top-level 'handle' function")
+                else:
+                    print("      ✓ handler.py imports cleanly and defines 'handle'")
+        except Exception as e:
+            problems += 1
+            print(f"      ✗ handler.py failed to import: {e}")
+        print()
+
+    return problems
 
 
 def _doctor_one(spec, shell_hooks) -> int:

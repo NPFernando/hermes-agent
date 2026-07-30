@@ -294,7 +294,7 @@ class TestHooksDoctor:
         cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
         with patch("hermes_cli.config.load_config", return_value=cfg):
             out = _run(SimpleNamespace(hooks_action="doctor"))
-        assert "All shell hooks look healthy" in out
+        assert "All hooks look healthy" in out
 
     def test_unallowlisted_script_is_not_executed(self, tmp_path):
         """Regression for M4: `hermes hooks doctor` used to run every
@@ -318,3 +318,64 @@ class TestHooksDoctor:
         )
         assert "not allowlisted" in out.lower()
         assert "skipped JSON smoke test" in out
+
+    def _write_gateway_hook(self, hooks_dir: Path, name: str, handler_body: str) -> None:
+        hook_dir = hooks_dir / name
+        hook_dir.mkdir(parents=True)
+        (hook_dir / "HOOK.yaml").write_text(f"name: {name}\nevents:\n  - agent:end\n")
+        (hook_dir / "handler.py").write_text(handler_body)
+
+    def test_gateway_hook_healthy_handler_reported_clean(self):
+        import os
+
+        hooks_dir = Path(os.environ["HERMES_HOME"]) / "hooks"
+        self._write_gateway_hook(
+            hooks_dir, "good-hook",
+            "async def handle(event_type, context):\n    pass\n",
+        )
+        with patch("hermes_cli.config.load_config", return_value={}):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+        assert "good-hook" in out
+        assert "imports cleanly and defines 'handle'" in out
+        assert "All hooks look healthy" in out
+
+    def test_gateway_hook_syntax_error_flagged_without_crashing_doctor(self):
+        """A broken handler.py must surface as a doctor finding, not crash
+        the whole `hermes hooks doctor` invocation for every other hook."""
+        import os
+
+        hooks_dir = Path(os.environ["HERMES_HOME"]) / "hooks"
+        self._write_gateway_hook(hooks_dir, "broken-hook", "def this is not valid python(\n")
+        with patch("hermes_cli.config.load_config", return_value={}):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+        assert "broken-hook" in out
+        assert "failed to import" in out
+        assert "issue(s) found" in out
+
+    def test_gateway_hook_missing_handle_function_flagged(self):
+        import os
+
+        hooks_dir = Path(os.environ["HERMES_HOME"]) / "hooks"
+        self._write_gateway_hook(hooks_dir, "no-handle-hook", "X = 1\n")
+        with patch("hermes_cli.config.load_config", return_value={}):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+        assert "no top-level 'handle' function" in out
+
+    def test_gateway_hook_handler_never_executed_by_doctor(self):
+        """Importing a module runs its top-level code (unavoidable to detect
+        a broken handler), but the doctor must never call handle() itself --
+        that would fire real side effects (DB writes, API calls) from a
+        diagnostic command. A handle() that touches a sentinel file proves
+        this by only running module-level code, not the coroutine body."""
+        import os
+
+        hooks_dir = Path(os.environ["HERMES_HOME"]) / "hooks"
+        sentinel = hooks_dir / "sentinel-touched"
+        self._write_gateway_hook(
+            hooks_dir, "side-effect-hook",
+            f"async def handle(event_type, context):\n"
+            f"    open({str(sentinel)!r}, 'w').close()\n",
+        )
+        with patch("hermes_cli.config.load_config", return_value={}):
+            _run(SimpleNamespace(hooks_action="doctor"))
+        assert not sentinel.exists()
