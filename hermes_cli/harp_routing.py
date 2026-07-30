@@ -17,14 +17,43 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 DEFAULT_SELECTOR = Path.home() / "workspace" / "labs" / "universal-harp-engine" / "scripts" / "harp-select-route.py"
 SUBPROCESS_TIMEOUT_SECONDS = 5
 DEFAULT_CACHE_TTL_SECONDS = 60
+HARP_PG_SCRIPTS_DIR = "/srv/projects/_hermes-control/scripts"
+DEFAULT_PAID_BUDGET_DAILY_USD = 2.0
+DEFAULT_PAID_BUDGET_MONTHLY_USD = 30.0
+# classify_task() can produce "security_review", but harp_pg's model_evaluations
+# table has no such task_type bucket yet (only "audit" is close) -- see
+# docs/hermes-agent-harp-routing-runbook.md's Phase 2 notes in the
+# universal-harp-engine repo. Map it for scoring-lookup purposes only; this
+# does not affect classify_task()'s own return value or select_route()'s
+# --task argument.
+TASK_TYPE_SCORING_ALIASES = {"security_review": "audit"}
+# Fallback when no eval data exists for a task_type at all.
+DEFAULT_REVIEWER_PROVIDER = "claude-cli"
+DEFAULT_REVIEWER_MODEL = "sonnet"
+
+
+def _harp_pg_connect():
+    """Import and connect to the harp_pg Postgres adapter, same pattern as
+    ~/.hermes/scripts/qc-harp.sh and cost-digest-daily.sh. Returns None on any
+    import/connection failure (fail-open) rather than raising."""
+    try:
+        if HARP_PG_SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, HARP_PG_SCRIPTS_DIR)
+        import harp_pg
+
+        return harp_pg.connect()
+    except Exception:
+        return None
 
 # In-process cache of recent decisions, keyed by (selector path, task, risk).
 # The routing decision is a pure function of current live conditions (rate
@@ -243,3 +272,119 @@ def status_summary(
         return {"enabled": True, "decision": None, "age_seconds": None}
     timestamp, decision = cached
     return {"enabled": True, "decision": decision, "age_seconds": round(time.monotonic() - timestamp, 1)}
+
+
+def _routing_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = config or {}
+    delegation = cfg.get("delegation")
+    routing = delegation.get("routing") if isinstance(delegation, dict) else None
+    return routing if isinstance(routing, dict) else {}
+
+
+def within_paid_budget(config: dict[str, Any] | None) -> bool:
+    """True if today's/this month's cumulative OpenRouter spend is under the
+    configured caps (``delegation.routing.paid_budget_daily_usd``/
+    ``paid_budget_monthly_usd``, defaults $2/day $30/month).
+
+    Fails open to ``False`` (block the paid route, fall through to
+    inherit_parent) on any DB/import error -- a budget gate that can't verify
+    spend must not silently approve it. Same ``openrouter_key_snapshots``
+    cumulative-usage query pattern as ``~/.hermes/scripts/cost-digest-daily.sh``.
+    """
+    routing_cfg = _routing_config(config)
+    try:
+        daily_cap = float(routing_cfg.get("paid_budget_daily_usd", DEFAULT_PAID_BUDGET_DAILY_USD))
+        monthly_cap = float(routing_cfg.get("paid_budget_monthly_usd", DEFAULT_PAID_BUDGET_MONTHLY_USD))
+    except (TypeError, ValueError):
+        daily_cap = DEFAULT_PAID_BUDGET_DAILY_USD
+        monthly_cap = DEFAULT_PAID_BUDGET_MONTHLY_USD
+
+    con = _harp_pg_connect()
+    if con is None:
+        return False
+    try:
+        cur = con.cursor()
+
+        def usage_at(hours_ago: float):
+            row = cur.execute(
+                "SELECT usage_usd FROM openrouter_key_snapshots "
+                "WHERE captured_at <= ? AND usage_usd IS NOT NULL "
+                "ORDER BY captured_at DESC LIMIT 1",
+                ((datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat(),),
+            ).fetchone()
+            return row[0] if row else None
+
+        latest_row = cur.execute(
+            "SELECT usage_usd FROM openrouter_key_snapshots "
+            "WHERE usage_usd IS NOT NULL ORDER BY captured_at DESC LIMIT 1"
+        ).fetchone()
+        if not latest_row:
+            return False  # no usage data at all -- can't verify, fail closed
+        usage_now = latest_row[0]
+
+        usage_24h = usage_at(24)
+        usage_30d = usage_at(24 * 30)
+        burn_24h = max(0.0, usage_now - usage_24h) if usage_24h is not None else 0.0
+        burn_30d = max(0.0, usage_now - usage_30d) if usage_30d is not None else 0.0
+
+        return burn_24h < daily_cap and burn_30d < monthly_cap
+    except Exception:
+        return False
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def is_free_route(route: dict[str, str] | None) -> bool:
+    """True if a ``select_route()``/``plan_delegation_route()`` route is a
+    free-tier OpenRouter model. Same heuristic already used elsewhere in this
+    codebase (``harp_universal/broker.py``'s `_hemes_routes` filter): a
+    ``":free"`` suffix on the model id. Avoids adding a ``tier`` field to
+    ``select_route()``'s established return shape, which several existing
+    tests assert exact equality against.
+    """
+    if not route:
+        return False
+    return route.get("provider") == "openrouter" and str(route.get("model") or "").endswith(":free")
+
+
+def top_scoring_model_for_task(task: str) -> dict[str, str] | None:
+    """Best-scoring ``{"model": ..., "provider": ...}`` for a task_type from
+    ``harp_pg``'s ``model_evaluations`` table (same connection/query pattern
+    as ``~/.hermes/scripts/qc-harp.sh``'s "DB Eval Scores" section).
+
+    Returns ``None`` on any failure or when no eval rows exist for this
+    task_type -- callers should fall back to their own default (this
+    function does not know what a safe default model/provider is).
+    ``task`` is mapped through ``TASK_TYPE_SCORING_ALIASES`` first (e.g.
+    ``security_review`` -> ``audit``) since the eval table doesn't have a
+    bucket for every ``classify_task()`` category yet.
+    """
+    eval_task_type = TASK_TYPE_SCORING_ALIASES.get(task, task)
+    con = _harp_pg_connect()
+    if con is None:
+        return None
+    try:
+        cur = con.cursor()
+        row = cur.execute(
+            "SELECT model_id FROM model_evaluations WHERE task_type = ? "
+            "ORDER BY quality_score DESC NULLS LAST LIMIT 1",
+            (eval_task_type,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        model_id = row[0]
+        # model_evaluations.model_id is a bare model identifier (e.g.
+        # "nvidia/nemotron-3-super-120b-a12b:free") -- provider is always
+        # openrouter for these rows in current data (confirmed 2026-07-30:
+        # all 9 populated task_type buckets are OpenRouter-catalog models).
+        return {"model": model_id, "provider": "openrouter"}
+    except Exception:
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass

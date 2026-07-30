@@ -2509,11 +2509,29 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Optional HARP-informed routing plan — shadow mode only (Phase 1): logs
-    # a classification/route recommendation but never changes credentials.
-    # "enforce" mode (actually using the plan) is not implemented yet. Fully
+    # Optional HARP-informed routing plan (hermes_cli/harp_routing.py). Fully
     # opt-in (default delegation.routing.mode: inherit_parent) and fail-open —
-    # any error here is swallowed, never affects delegation itself.
+    # any error here falls through to the normal _resolve_delegation_credentials()
+    # call below, never blocks delegation itself (except the explicit
+    # high-risk/no-eligible-route case, which is an intentional block, not a
+    # bug -- see the non-negotiable invariants in
+    # ~/.claude/plans/tranquil-munching-canyon.md).
+    #
+    # "shadow" mode: logs a plan, never changes credentials.
+    # "enforce" mode: resolves real credentials for the HARP-selected
+    # provider/model via the same resolve_runtime_provider() the "explicit
+    # provider configured" branch of _resolve_delegation_credentials() already
+    # uses (see that function's docstring) -- no new credential-resolution
+    # path, just reusing the existing one with HARP's pick instead of a
+    # static config.yaml value. Budget-cap gating only applies to paid
+    # (non-":free") routes -- free routes proceed regardless of budget.
+    # Per-category eval scoring (harp_routing.top_scoring_model_for_task) is
+    # logged as an informational signal only, NOT used to override the
+    # route -- the eval table has no liveness awareness and can surface
+    # delisted models (confirmed: "audit"'s current top scorer is
+    # openrouter/owl-alpha, delisted 2026-07), unlike harp-select-route.py's
+    # own freshness-gated candidate order.
+    _harp_enforce_creds: dict | None = None
     try:
         _routing_cfg = cfg.get("delegation", {}).get("routing", {}) if isinstance(cfg, dict) else {}
         _routing_mode = _routing_cfg.get("mode", "inherit_parent") if isinstance(_routing_cfg, dict) else "inherit_parent"
@@ -2523,13 +2541,78 @@ def delegate_task(
             _shadow_goal = goal or (tasks[0].get("goal") if tasks and isinstance(tasks, list) and tasks and isinstance(tasks[0], dict) else None)
             _harp_plan = plan_delegation_route(cfg, goal_text=_shadow_goal)
             logger.info(
-                "delegate_task harp_routing shadow plan: mode=%s task=%s risk=%s "
+                "delegate_task harp_routing plan: mode=%s task=%s risk=%s "
                 "fallback_mode=%s route=%s",
                 _routing_mode, _harp_plan["task"], _harp_plan["risk"],
                 _harp_plan["fallback_mode"], _harp_plan["route"],
             )
+
+            if _routing_mode == "enforce":
+                from hermes_cli.harp_routing import is_free_route, top_scoring_model_for_task, within_paid_budget
+
+                try:
+                    _top_scorer = top_scoring_model_for_task(_harp_plan["task"])
+                    if _top_scorer:
+                        logger.info(
+                            "delegate_task harp_routing eval-score signal (informational "
+                            "only, not used for routing): task=%s top_scorer=%s",
+                            _harp_plan["task"], _top_scorer,
+                        )
+                except Exception:
+                    pass
+
+                _route = _harp_plan["route"]
+                _is_high_risk = _harp_plan["risk"] in ("high_risk", "production")
+                if _route:
+                    _budget_ok = is_free_route(_route) or within_paid_budget(cfg)
+                    if not _budget_ok:
+                        logger.info(
+                            "delegate_task harp_routing enforce: paid route %s over budget "
+                            "cap, falling through to inherit_parent", _route,
+                        )
+                    else:
+                        try:
+                            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                            _runtime = resolve_runtime_provider(
+                                requested=_route["provider"], target_model=_route["model"],
+                            )
+                            if _runtime.get("api_key"):
+                                _harp_enforce_creds = {
+                                    "model": _route["model"],
+                                    "provider": _runtime.get("provider") or _route["provider"],
+                                    "base_url": _runtime.get("base_url"),
+                                    "api_key": _runtime.get("api_key"),
+                                    "api_mode": _runtime.get("api_mode"),
+                                }
+                        except Exception as _enforce_cred_exc:
+                            logger.warning(
+                                "delegate_task harp_routing enforce credential resolution "
+                                "failed (falling through): %r", _enforce_cred_exc,
+                            )
+
+                if _harp_enforce_creds is None and _is_high_risk:
+                    return tool_error(
+                        f"delegate_task blocked: delegation.routing.mode=enforce with "
+                        f"risk={_harp_plan['risk']} has no eligible HARP route (selector "
+                        "unavailable, blocked, or the route was paid and over the budget "
+                        "cap), and high-risk/production tasks are never silently downgraded "
+                        "to inherited credentials. Set delegation.routing.mode: shadow or "
+                        "inherit_parent to bypass, or resolve the underlying selector/budget "
+                        "issue."
+                    )
     except Exception as _harp_shadow_exc:
-        logger.debug("delegate_task harp_routing shadow plan failed (non-fatal): %r", _harp_shadow_exc)
+        # Residual edge case: plan_delegation_route() itself is documented to
+        # never raise (fail-open internally), so this only fires for an
+        # unexpected failure upstream of it (e.g. an import error) -- in that
+        # rare case a high-risk enforce-mode task falls through to
+        # inherit_parent here rather than blocking, which is a narrower
+        # exception to the "never silently downgrade high-risk" invariant
+        # than the explicit, expected no-route case above (which does block
+        # correctly). Accepted trade-off: blocking delegate_task entirely on
+        # any transient unrelated error would likely cause more disruption
+        # than the narrow gap it closes.
+        logger.debug("delegate_task harp_routing plan failed (non-fatal): %r", _harp_shadow_exc)
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -2537,7 +2620,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _harp_enforce_creds if _harp_enforce_creds is not None else _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
 

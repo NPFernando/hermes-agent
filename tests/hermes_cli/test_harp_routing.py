@@ -162,6 +162,155 @@ def test_cache_expires_after_ttl(monkeypatch, tmp_path):
     assert call_count["n"] == 2, "cache_ttl_seconds: 0 should disable caching entirely"
 
 
+class _FakeCursor:
+    """Minimal fake matching the subset of the sqlite3/harp_pg cursor
+    interface these functions use: execute(sql, params).fetchone()."""
+
+    def __init__(self, rows_by_query):
+        # rows_by_query: dict mapping a substring of the SQL to a fixed
+        # fetchone() return value (a tuple, or None).
+        self._rows_by_query = rows_by_query
+
+    def execute(self, sql, params=()):
+        for substring, row in self._rows_by_query.items():
+            if substring in sql:
+                self._next_row = row
+                return self
+        self._next_row = None
+        return self
+
+    def fetchone(self):
+        return self._next_row
+
+
+class _FakeConn:
+    def __init__(self, rows_by_query):
+        self._cursor = _FakeCursor(rows_by_query)
+
+    def cursor(self):
+        return self._cursor
+
+    def close(self):
+        pass
+
+
+def test_is_free_route():
+    assert harp_routing.is_free_route({"model": "nvidia/x:free", "provider": "openrouter"}) is True
+    assert harp_routing.is_free_route({"model": "gpt-4o", "provider": "openai-codex"}) is False
+    assert harp_routing.is_free_route({"model": "x:free", "provider": "anthropic"}) is False  # wrong provider
+    assert harp_routing.is_free_route(None) is False
+    assert harp_routing.is_free_route({}) is False
+
+
+def test_within_paid_budget_under_cap(monkeypatch):
+    # Conn whose cursor always returns usage_now=1.0, and both historical
+    # lookups return None (no earlier snapshot -> burn treated as 0), well
+    # under the default $2/$30 caps.
+    def fake_execute(self, sql, params=()):
+        if "captured_at <=" in sql:
+            self._next_row = None  # no historical snapshot -> burn = 0
+        elif "usage_usd IS NOT NULL ORDER BY captured_at DESC LIMIT 1" in sql:
+            self._next_row = (1.0,)
+        else:
+            self._next_row = None
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+    assert harp_routing.within_paid_budget({}) is True
+
+
+def test_within_paid_budget_over_daily_cap(monkeypatch):
+    def fake_execute(self, sql, params=()):
+        if "captured_at <=" in sql:
+            self._next_row = (1.0,)  # usage 24h ago was $1.0
+        elif "usage_usd IS NOT NULL ORDER BY captured_at DESC LIMIT 1" in sql:
+            self._next_row = (10.0,)  # usage now is $10.0 -> burn_24h = $9.0 > $2 cap
+        else:
+            self._next_row = None
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+    assert harp_routing.within_paid_budget({}) is False
+
+
+def test_within_paid_budget_no_connection_fails_closed(monkeypatch):
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: None)
+    assert harp_routing.within_paid_budget({}) is False
+
+
+def test_within_paid_budget_no_usage_data_fails_closed(monkeypatch):
+    def fake_execute(self, sql, params=()):
+        self._next_row = None
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+    assert harp_routing.within_paid_budget({}) is False
+
+
+def test_within_paid_budget_uses_custom_config_caps(monkeypatch):
+    def fake_execute(self, sql, params=()):
+        if "captured_at <=" in sql:
+            self._next_row = (1.0,)
+        elif "usage_usd IS NOT NULL ORDER BY captured_at DESC LIMIT 1" in sql:
+            self._next_row = (2.5,)  # burn_24h = $1.5
+        else:
+            self._next_row = None
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+    # $1.5 burn is under the default $2 cap...
+    assert harp_routing.within_paid_budget({}) is True
+    # ...but over a stricter configured $1 cap.
+    config = {"delegation": {"routing": {"paid_budget_daily_usd": 1.0, "paid_budget_monthly_usd": 30.0}}}
+    assert harp_routing.within_paid_budget(config) is False
+
+
+def test_top_scoring_model_for_task_returns_best_scorer(monkeypatch):
+    def fake_execute(self, sql, params=()):
+        assert params == ("code_review",)
+        self._next_row = ("some/best-model:free",)
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+    assert harp_routing.top_scoring_model_for_task("code_review") == {
+        "model": "some/best-model:free", "provider": "openrouter",
+    }
+
+
+def test_top_scoring_model_for_task_maps_security_review_to_audit(monkeypatch):
+    seen_params = []
+
+    def fake_execute(self, sql, params=()):
+        seen_params.append(params)
+        self._next_row = ("audit-model", )
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+    harp_routing.top_scoring_model_for_task("security_review")
+    assert seen_params == [("audit",)]
+
+
+def test_top_scoring_model_for_task_none_when_no_rows(monkeypatch):
+    def fake_execute(self, sql, params=()):
+        self._next_row = None
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+    assert harp_routing.top_scoring_model_for_task("nonexistent_task") is None
+
+
+def test_top_scoring_model_for_task_no_connection_returns_none(monkeypatch):
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: None)
+    assert harp_routing.top_scoring_model_for_task("code_review") is None
+
+
 def test_status_summary_disabled():
     assert harp_routing.status_summary({}) == {"enabled": False, "decision": None, "age_seconds": None}
 

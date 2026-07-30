@@ -2413,9 +2413,20 @@ DEFAULT_CONFIG = {
         # default — "inherit_parent" preserves today's behavior exactly
         # (empty delegation.model/provider above -> child inherits parent).
         # "shadow" computes and logs a routing plan without changing
-        # credentials. "enforce" is not implemented yet (Phase 2).
+        # credentials. "enforce" resolves real credentials for the
+        # HARP-selected provider/model (see
+        # hermes_cli/harp_routing.py::resolve_delegation_route_credentials),
+        # subject to the budget cap below and the same fail-closed policy
+        # for high-risk/production tasks (blocked, not silently downgraded).
         "routing": {
             "mode": "inherit_parent",  # inherit_parent | shadow | enforce
+            # Auto-approved paid-route ceiling for "enforce" mode -- checked
+            # against the same openrouter_key_snapshots cumulative-usage data
+            # cost-digest-daily.sh already reads. No per-run prompt; over the
+            # cap silently falls through to inherit_parent (logged, not an
+            # error). Conservative defaults matching recent spend pace.
+            "paid_budget_daily_usd": 2.0,
+            "paid_budget_monthly_usd": 30.0,
         },
     },
 
