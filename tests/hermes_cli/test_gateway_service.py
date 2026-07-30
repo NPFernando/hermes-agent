@@ -239,7 +239,30 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
 
-        gateway_cli.run_gateway()
+        # run_gateway() ends every path (success, KeyboardInterrupt, SystemExit)
+        # in _hard_exit_after_gateway_teardown() -> gateway.run._exit_after_graceful_shutdown(),
+        # which deliberately calls os._exit() to bypass Python finalization
+        # (see that function's docstring — wedge-proofing against non-daemon
+        # threads). Left unmocked, this call really executes os._exit(0) here,
+        # hard-killing the *entire pytest process* mid-suite: every later test
+        # file silently never runs, yet the process exit code is 0 (os._exit(0)),
+        # which looks like a clean, complete, all-green run. Same pattern
+        # test_gateway_run_hard_exit.py already uses for exactly this reason.
+        import gateway.run as gateway_run
+
+        class _HardExitObserved(BaseException):
+            def __init__(self, code: int):
+                super().__init__(code)
+                self.code = code
+
+        def _hard_exit(code: int) -> None:
+            raise _HardExitObserved(code)
+
+        monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", _hard_exit)
+
+        with pytest.raises(_HardExitObserved) as exc_info:
+            gateway_cli.run_gateway()
+        assert exc_info.value.code == 0
 
         assert unit_path.read_text(encoding="utf-8") == "new unit\n"
         assert ["systemctl", "--user", "daemon-reload"] in calls
