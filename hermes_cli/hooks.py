@@ -48,6 +48,66 @@ def hooks_command(args) -> None:
 # list
 # ---------------------------------------------------------------------------
 
+def _list_gateway_hooks() -> List[Dict[str, Any]]:
+    """Enumerate the directory-based Python gateway hooks under
+    ``~/.hermes/hooks/*/HOOK.yaml``.
+
+    This is a separate, non-overlapping registration system from the
+    ``hooks:`` block in config.yaml handled by the rest of this module --
+    see gateway/hooks.py's HookRegistry.discover_and_load(), which is what
+    actually loads and fires these at runtime. We mirror its discovery
+    logic here (manifest presence/shape checks) but only ever read the
+    YAML, never import/execute handler.py, since this is a read-only
+    listing command.
+    """
+    import yaml
+
+    from hermes_cli.config import get_hermes_home
+
+    hooks_dir = get_hermes_home() / "hooks"
+    found: List[Dict[str, Any]] = []
+    if not hooks_dir.exists():
+        return found
+
+    for hook_dir in sorted(hooks_dir.iterdir()):
+        if not hook_dir.is_dir():
+            continue
+        manifest_path = hook_dir / "HOOK.yaml"
+        handler_path = hook_dir / "handler.py"
+        if not manifest_path.exists() or not handler_path.exists():
+            continue
+        try:
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not manifest or not isinstance(manifest, dict):
+            continue
+        found.append(
+            {
+                "name": manifest.get("name", hook_dir.name),
+                "description": manifest.get("description", ""),
+                "events": manifest.get("events", []),
+            }
+        )
+    return found
+
+
+def _print_gateway_hooks() -> None:
+    gateway_hooks = _list_gateway_hooks()
+    if not gateway_hooks:
+        return
+
+    print(f"Gateway lifecycle hooks ({len(gateway_hooks)} total):")
+    print("(Python, discovered from ~/.hermes/hooks/*/HOOK.yaml — not part of")
+    print(" the shell-hook allowlist above; see gateway/hooks.py)\n")
+    for hook in gateway_hooks:
+        events = ", ".join(hook["events"]) if hook["events"] else "(none declared)"
+        print(f"  - {hook['name']}  [{events}]")
+        if hook["description"]:
+            print(f"      {hook['description']}")
+    print()
+
+
 def _cmd_list(_args) -> None:
     from hermes_cli.config import load_config
     from agent import shell_hooks
@@ -59,6 +119,7 @@ def _cmd_list(_args) -> None:
         print("See `hermes hooks --help` or")
         print("    website/docs/user-guide/features/hooks.md")
         print("for the config schema and worked examples.")
+        _print_gateway_hooks()
         return
 
     by_event: Dict[str, List] = {}
@@ -98,6 +159,8 @@ def _cmd_list(_args) -> None:
                             f"run `hermes hooks doctor` to re-validate"
                         )
         print()
+
+    _print_gateway_hooks()
 
 
 # ---------------------------------------------------------------------------

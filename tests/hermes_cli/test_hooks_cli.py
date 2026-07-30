@@ -75,6 +75,59 @@ class TestHooksList:
         assert "✗ not allowlisted" in out
         assert str(script) in out
 
+    def _write_gateway_hook(self, hooks_dir: Path, name: str, events: list[str]) -> None:
+        hook_dir = hooks_dir / name
+        hook_dir.mkdir(parents=True)
+        (hook_dir / "HOOK.yaml").write_text(
+            f"name: {name}\ndescription: test hook {name}\nevents:\n"
+            + "".join(f"  - {e}\n" for e in events)
+        )
+        (hook_dir / "handler.py").write_text(
+            "async def handle(event_type, context):\n    pass\n"
+        )
+
+    def test_lists_gateway_lifecycle_hooks_alongside_shell_hooks(self, tmp_path, monkeypatch):
+        """Directory-based Python hooks under ~/.hermes/hooks/*/HOOK.yaml are a
+        completely separate registration system from the config.yaml `hooks:`
+        block (see gateway/hooks.py's HookRegistry) -- they were previously
+        invisible to `hermes hooks list` even though they're loaded and fired
+        at runtime. This must surface them without importing/executing
+        handler.py (a listing command should never run handler code)."""
+        import os
+
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        hooks_dir = hermes_home / "hooks"
+        self._write_gateway_hook(hooks_dir, "harp-usage-logger", ["agent:end"])
+
+        with patch("hermes_cli.config.load_config", return_value={}):
+            out = _run(SimpleNamespace(hooks_action="list"))
+
+        assert "Gateway lifecycle hooks" in out
+        assert "harp-usage-logger" in out
+        assert "agent:end" in out
+        assert "test hook harp-usage-logger" in out
+
+    def test_no_gateway_hooks_dir_prints_no_extra_section(self, tmp_path):
+        with patch("hermes_cli.config.load_config", return_value={}):
+            out = _run(SimpleNamespace(hooks_action="list"))
+        assert "Gateway lifecycle hooks" not in out
+
+    def test_gateway_hook_missing_handler_is_skipped(self, monkeypatch):
+        """A HOOK.yaml with no handler.py isn't a loadable hook (matches
+        gateway/hooks.py's own discover_and_load() skip condition) -- must
+        not be listed as though it were."""
+        import os
+
+        hooks_dir = Path(os.environ["HERMES_HOME"]) / "hooks"
+        hook_dir = hooks_dir / "incomplete-hook"
+        hook_dir.mkdir(parents=True)
+        (hook_dir / "HOOK.yaml").write_text("name: incomplete-hook\nevents:\n  - agent:end\n")
+
+        with patch("hermes_cli.config.load_config", return_value={}):
+            out = _run(SimpleNamespace(hooks_action="list"))
+
+        assert "incomplete-hook" not in out
+
 
 # ── test ──────────────────────────────────────────────────────────────────
 
