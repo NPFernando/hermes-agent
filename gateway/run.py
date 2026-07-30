@@ -4407,12 +4407,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _harp_cfg = load_config_readonly()
                 _harp_was_enabled = is_enabled(_harp_cfg)
                 _harp_chat_type = getattr(source, "chat_type", None) if source is not None else None
+                _harp_task = classify_task(message_text)
+                _harp_risk = risk_for_chat_type(_harp_chat_type)
                 harp_route = (
-                    select_route(
-                        _harp_cfg,
-                        task=classify_task(message_text),
-                        risk=risk_for_chat_type(_harp_chat_type),
-                    )
+                    select_route(_harp_cfg, task=_harp_task, risk=_harp_risk)
                     if _harp_was_enabled else None
                 )
             except Exception as _harp_exc:
@@ -4438,9 +4436,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             harp_route["provider"]
                         )
                     logger.info(
-                        "harp_routing selected model: session=%s config_model=%s -> harp_model=%s provider=%s",
+                        "harp_routing selected model: session=%s config_model=%s -> harp_model=%s "
+                        "provider=%s task=%s risk=%s",
                         resolved_session_key or "", model, harp_route["model"],
-                        harp_route["provider"],
+                        harp_route["provider"], _harp_task, _harp_risk,
                     )
                     return harp_route["model"], harp_runtime
 
