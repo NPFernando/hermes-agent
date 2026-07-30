@@ -61,8 +61,13 @@ def _harp_pg_connect():
 # per message is unnecessary overhead on fast back-and-forth conversations.
 # Failures are cached too (short TTL), so a genuinely-down selector doesn't
 # spawn a subprocess (and log a warning) on every single message.
+#
+# Caches the RAW stdout text, not the parsed {"model", "provider"} dict --
+# select_route() and get_candidate_chain() both need to parse the same
+# subprocess output (top pick vs. the full ROUTE_CHAIN: block) without
+# spawning two subprocesses for one logical decision.
 _cache_lock = threading.Lock()
-_cache: dict[tuple[str, str, str], tuple[float, dict[str, str] | None]] = {}
+_cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
 
 
 def _harp_routing_config(config: dict[str, Any] | None) -> dict[str, Any]:
@@ -134,34 +139,21 @@ def classify_task(message_text: str | None) -> str:
     return "text_summary"
 
 
-def select_route(
+def _run_selector(
     config: dict[str, Any] | None,
     *,
-    task: str = "text_summary",
-    risk: str = "standard",
-    selector_path: Path | None = None,
-) -> dict[str, str] | None:
-    """Return ``{"model": ..., "provider": ...}`` or ``None`` (fail open).
+    task: str,
+    risk: str,
+    selector_path: Path | None,
+) -> str | None:
+    """Run (or reuse a cached run of) ``harp-select-route.py`` for a given
+    (selector, task, risk) and return its raw stdout, or ``None`` on any
+    disabled/missing/failed/timed-out condition (fail open).
 
-    ``task`` defaults to the conservative choice already listed in
-    ``approved_families`` for the canary-readiness gate — this hook does not
-    attempt per-conversation task classification yet (no message content is
-    available at the call site). ``risk`` defaults to ``"standard"`` here,
-    but callers with a chat-type signal should pass ``risk_for_chat_type(...)``
-    instead — see ``gateway/run.py``'s ``_resolve_session_agent_runtime``.
-
-    Cached briefly per (selector, task, risk) — see ``DEFAULT_CACHE_TTL_SECONDS``
-    / ``harp_routing.cache_ttl_seconds`` in config.yaml. Set the config key to
-    ``0`` to disable caching entirely.
-
-    Note: ``harp-select-route.py`` only accepts ``--task``/``--risk``/
-    ``--allow-review-only``/``--json`` (confirmed via ``--help``) — there is
-    no ``--data-class``/``--action-mode`` flag to pass through, unlike the
-    broader ``harp_universal.contracts.TaskRequest`` schema used elsewhere in
-    the universal-harp-engine repo. Callers needing data-class/action-mode as
-    *policy* context (not selector input) should carry them separately — see
-    ``plan_delegation_route()``, which accepts them for shadow-mode logging
-    without forwarding anything unsupported to this subprocess call.
+    Shared by ``select_route()`` (parses the top ``MODEL:``/``PROVIDER:``
+    fields) and ``get_candidate_chain()`` (parses the full ``ROUTE_CHAIN:``
+    block) so one logical routing decision costs exactly one subprocess call
+    and one cache entry, not two.
     """
     if not is_enabled(config):
         return None
@@ -195,15 +187,127 @@ def select_route(
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        result = None
+        raw = None
     else:
-        result = _parse_selector_output(completed.stdout) if completed.returncode == 0 else None
+        raw = completed.stdout if completed.returncode == 0 else None
 
     if ttl > 0:
         with _cache_lock:
-            _cache[cache_key] = (now, result)
+            _cache[cache_key] = (now, raw)
 
-    return result
+    return raw
+
+
+def select_route(
+    config: dict[str, Any] | None,
+    *,
+    task: str = "text_summary",
+    risk: str = "standard",
+    selector_path: Path | None = None,
+) -> dict[str, str] | None:
+    """Return ``{"model": ..., "provider": ...}`` or ``None`` (fail open).
+
+    ``task`` defaults to the conservative choice already listed in
+    ``approved_families`` for the canary-readiness gate — this hook does not
+    attempt per-conversation task classification yet (no message content is
+    available at the call site). ``risk`` defaults to ``"standard"`` here,
+    but callers with a chat-type signal should pass ``risk_for_chat_type(...)``
+    instead — see ``gateway/run.py``'s ``_resolve_session_agent_runtime``.
+
+    Cached briefly per (selector, task, risk) — see ``DEFAULT_CACHE_TTL_SECONDS``
+    / ``harp_routing.cache_ttl_seconds`` in config.yaml. Set the config key to
+    ``0`` to disable caching entirely.
+
+    Note: ``harp-select-route.py`` only accepts ``--task``/``--risk``/
+    ``--allow-review-only``/``--json`` (confirmed via ``--help``) — there is
+    no ``--data-class``/``--action-mode`` flag to pass through, unlike the
+    broader ``harp_universal.contracts.TaskRequest`` schema used elsewhere in
+    the universal-harp-engine repo. Callers needing data-class/action-mode as
+    *policy* context (not selector input) should carry them separately — see
+    ``plan_delegation_route()``, which accepts them for shadow-mode logging
+    without forwarding anything unsupported to this subprocess call.
+    """
+    raw = _run_selector(config, task=task, risk=risk, selector_path=selector_path)
+    if raw is None:
+        return None
+    return _parse_selector_output(raw)
+
+
+_ROUTE_CHAIN_LINE = re.compile(
+    r"^\s*\d+\.\s+(?P<provider>\S+)\s*/\s*(?P<model>\S+)\s*"
+    r"\[(?P<tier>[^/\]]+)/(?P<role>[^\]]+)\]"
+    r"(?:\s+score=(?P<score>[\d.]+))?\s*$"
+)
+
+
+def _parse_route_chain(text: str) -> list[dict[str, Any]]:
+    """Parse the ``ROUTE_CHAIN:`` block from ``harp-select-route.py``'s
+    output into an ordered list of candidates, e.g.::
+
+        1. openrouter / nvidia/nemotron-3-super-120b-a12b:free [free/primary_free] score=54.85
+        2. openrouter / nvidia/nemotron-3-ultra-550b-a55b:free [free/free_fallback] score=39.9
+        3. openrouter / google/gemma-4-31b-it:free [free/free_fallback]
+
+    Each entry: ``{"rank": int, "provider": str, "model": str, "tier": str,
+    "role": str, "score": float | None}``. ``score`` is optional in the
+    selector's own output (not every candidate has eval data), so it's
+    ``None`` when absent rather than a fabricated value. Lines that don't
+    match the expected shape are skipped rather than raising — this is
+    parsing another script's text output, not a stable wire format, so a
+    malformed/renumbered line degrades to "one fewer candidate" instead of
+    breaking the whole parse.
+    """
+    chain: list[dict[str, Any]] = []
+    in_chain = False
+    for line in text.splitlines():
+        if line.strip() == "ROUTE_CHAIN:" or line.rstrip().endswith("ROUTE_CHAIN:"):
+            in_chain = True
+            continue
+        if not in_chain:
+            continue
+        if not line.strip():
+            continue
+        m = _ROUTE_CHAIN_LINE.match(line)
+        if not m:
+            # First non-matching line after the header ends the block (the
+            # selector's output has nothing after ROUTE_CHAIN: today, but
+            # this keeps the parse bounded if that ever changes).
+            break
+        rank_match = re.match(r"^\s*(\d+)\.", line)
+        chain.append({
+            "rank": int(rank_match.group(1)) if rank_match else len(chain) + 1,
+            "provider": m.group("provider"),
+            "model": m.group("model"),
+            "tier": m.group("tier").strip(),
+            "role": m.group("role").strip(),
+            "score": float(m.group("score")) if m.group("score") else None,
+        })
+    return chain
+
+
+def get_candidate_chain(
+    config: dict[str, Any] | None,
+    *,
+    task: str = "text_summary",
+    risk: str = "standard",
+    selector_path: Path | None = None,
+) -> list[dict[str, Any]] | None:
+    """Full ranked candidate chain from ``harp-select-route.py``'s
+    ``ROUTE_CHAIN:`` block, or ``None`` on disabled/missing/failed (fail
+    open, same semantics as ``select_route()``).
+
+    This is the selector's own liveness-filtered candidate order — dead or
+    delisted models never appear here, unlike ``model_evaluations`` (a
+    static scoring snapshot with no liveness awareness). Built for
+    ``top_scoring_model_for_task()`` to cross-reference an eval-table pick
+    against real-time availability before trusting it. Shares one cached
+    subprocess call with ``select_route()`` for the same (selector, task,
+    risk) — see ``_run_selector()``.
+    """
+    raw = _run_selector(config, task=task, risk=risk, selector_path=selector_path)
+    if raw is None:
+        return None
+    return _parse_route_chain(raw)
 
 
 def plan_delegation_route(
@@ -270,7 +374,8 @@ def status_summary(
         cached = _cache.get(cache_key)
     if cached is None:
         return {"enabled": True, "decision": None, "age_seconds": None}
-    timestamp, decision = cached
+    timestamp, raw = cached
+    decision = _parse_selector_output(raw) if raw is not None else None
     return {"enabled": True, "decision": decision, "age_seconds": round(time.monotonic() - timestamp, 1)}
 
 
@@ -350,7 +455,13 @@ def is_free_route(route: dict[str, str] | None) -> bool:
     return route.get("provider") == "openrouter" and str(route.get("model") or "").endswith(":free")
 
 
-def top_scoring_model_for_task(task: str) -> dict[str, str] | None:
+def top_scoring_model_for_task(
+    task: str,
+    *,
+    config: dict[str, Any] | None = None,
+    risk: str = "standard",
+    selector_path: Path | None = None,
+) -> dict[str, str] | None:
     """Best-scoring ``{"model": ..., "provider": ...}`` for a task_type from
     ``harp_pg``'s ``model_evaluations`` table (same connection/query pattern
     as ``~/.hermes/scripts/qc-harp.sh``'s "DB Eval Scores" section).
@@ -361,6 +472,24 @@ def top_scoring_model_for_task(task: str) -> dict[str, str] | None:
     ``task`` is mapped through ``TASK_TYPE_SCORING_ALIASES`` first (e.g.
     ``security_review`` -> ``audit``) since the eval table doesn't have a
     bucket for every ``classify_task()`` category yet.
+
+    **Cross-referencing (opt-in via ``config``)**: ``model_evaluations`` is a
+    static scoring snapshot with no liveness awareness -- it previously
+    surfaced ``openrouter/owl-alpha`` as the top scorer for ``audit`` despite
+    that model being delisted from OpenRouter (2026-07). When ``config`` is
+    given, this walks the eval rows for the task_type in score order and
+    returns the first one that also appears in
+    ``get_candidate_chain(config, task=task, risk=risk)`` -- the selector's
+    own liveness-filtered candidate list, which by construction never
+    contains dead/delisted models. If no eval candidate appears in the live
+    chain (or the chain can't be fetched at all), returns ``None`` rather
+    than falling back to the raw top scorer -- a pick this function can't
+    verify is live is worse than no pick, for any caller that might one day
+    treat this as more than informational.
+
+    When ``config`` is omitted (the original call shape), no cross-check is
+    performed and the raw top-scoring row is returned unchanged -- existing
+    informational-only callers and tests are unaffected.
     """
     eval_task_type = TASK_TYPE_SCORING_ALIASES.get(task, task)
     con = _harp_pg_connect()
@@ -368,19 +497,38 @@ def top_scoring_model_for_task(task: str) -> dict[str, str] | None:
         return None
     try:
         cur = con.cursor()
-        row = cur.execute(
+        if config is None:
+            row = cur.execute(
+                "SELECT model_id FROM model_evaluations WHERE task_type = ? "
+                "ORDER BY quality_score DESC NULLS LAST LIMIT 1",
+                (eval_task_type,),
+            ).fetchone()
+            if not row or not row[0]:
+                return None
+            # model_evaluations.model_id is a bare model identifier (e.g.
+            # "nvidia/nemotron-3-super-120b-a12b:free") -- provider is always
+            # openrouter for these rows in current data (confirmed
+            # 2026-07-30: all 9 populated task_type buckets are
+            # OpenRouter-catalog models).
+            return {"model": row[0], "provider": "openrouter"}
+
+        rows = cur.execute(
             "SELECT model_id FROM model_evaluations WHERE task_type = ? "
-            "ORDER BY quality_score DESC NULLS LAST LIMIT 1",
+            "ORDER BY quality_score DESC NULLS LAST",
             (eval_task_type,),
-        ).fetchone()
-        if not row or not row[0]:
+        ).fetchall()
+        if not rows:
             return None
-        model_id = row[0]
-        # model_evaluations.model_id is a bare model identifier (e.g.
-        # "nvidia/nemotron-3-super-120b-a12b:free") -- provider is always
-        # openrouter for these rows in current data (confirmed 2026-07-30:
-        # all 9 populated task_type buckets are OpenRouter-catalog models).
-        return {"model": model_id, "provider": "openrouter"}
+
+        chain = get_candidate_chain(config, task=task, risk=risk, selector_path=selector_path)
+        if not chain:
+            return None
+        live_models = {c["model"] for c in chain}
+
+        for row in rows:
+            if row and row[0] and row[0] in live_models:
+                return {"model": row[0], "provider": "openrouter"}
+        return None
     except Exception:
         return None
     finally:

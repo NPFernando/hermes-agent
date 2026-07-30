@@ -2527,10 +2527,14 @@ def delegate_task(
     # (non-":free") routes -- free routes proceed regardless of budget.
     # Per-category eval scoring (harp_routing.top_scoring_model_for_task) is
     # logged as an informational signal only, NOT used to override the
-    # route -- the eval table has no liveness awareness and can surface
-    # delisted models (confirmed: "audit"'s current top scorer is
-    # openrouter/owl-alpha, delisted 2026-07), unlike harp-select-route.py's
-    # own freshness-gated candidate order.
+    # route. The eval table itself has no liveness awareness and can surface
+    # delisted models (confirmed: "audit"'s raw top scorer is
+    # openrouter/owl-alpha, delisted 2026-07) -- as of 2026-07-31 the call
+    # below passes config= so it cross-references against
+    # harp-select-route.py's own live ROUTE_CHAIN before returning a pick
+    # (see top_scoring_model_for_task()'s docstring), so this log line no
+    # longer surfaces dead models. Still deliberately not routing-
+    # determinative: promoting it to that would be a separate, larger change.
     _harp_enforce_creds: dict | None = None
     try:
         _routing_cfg = cfg.get("delegation", {}).get("routing", {}) if isinstance(cfg, dict) else {}
@@ -2551,7 +2555,16 @@ def delegate_task(
                 from hermes_cli.harp_routing import is_free_route, top_scoring_model_for_task, within_paid_budget
 
                 try:
-                    _top_scorer = top_scoring_model_for_task(_harp_plan["task"])
+                    # config= enables candidate-chain cross-referencing:
+                    # top_scoring_model_for_task() now cross-checks the eval
+                    # table's pick against harp-select-route.py's own live
+                    # ROUTE_CHAIN before returning it, so this log line can no
+                    # longer surface a delisted model (the historical
+                    # openrouter/owl-alpha case) as though it were a live
+                    # signal. Still informational only -- not used for routing.
+                    _top_scorer = top_scoring_model_for_task(
+                        _harp_plan["task"], config=cfg, risk=_harp_plan["risk"],
+                    )
                     if _top_scorer:
                         logger.info(
                             "delegate_task harp_routing eval-score signal (informational "

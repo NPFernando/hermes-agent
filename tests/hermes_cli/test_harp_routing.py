@@ -164,12 +164,13 @@ def test_cache_expires_after_ttl(monkeypatch, tmp_path):
 
 class _FakeCursor:
     """Minimal fake matching the subset of the sqlite3/harp_pg cursor
-    interface these functions use: execute(sql, params).fetchone()."""
+    interface these functions use: execute(sql, params).fetchone()/.fetchall()."""
 
     def __init__(self, rows_by_query):
         # rows_by_query: dict mapping a substring of the SQL to a fixed
         # fetchone() return value (a tuple, or None).
         self._rows_by_query = rows_by_query
+        self._next_rows = []
 
     def execute(self, sql, params=()):
         for substring, row in self._rows_by_query.items():
@@ -181,6 +182,9 @@ class _FakeCursor:
 
     def fetchone(self):
         return self._next_row
+
+    def fetchall(self):
+        return self._next_rows
 
 
 class _FakeConn:
@@ -309,6 +313,155 @@ def test_top_scoring_model_for_task_none_when_no_rows(monkeypatch):
 def test_top_scoring_model_for_task_no_connection_returns_none(monkeypatch):
     monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: None)
     assert harp_routing.top_scoring_model_for_task("code_review") is None
+
+
+_SAMPLE_ROUTE_CHAIN_OUTPUT = """DECISION: free_first
+TASK: code_generation
+RISK: standard
+MODEL: nvidia/nemotron-3-super-120b-a12b:free
+PROVIDER: openrouter
+TIER: free
+PAID_FINAL_REVIEW_REQUIRED: false
+REASON: free model available
+ROUTE_CHAIN:
+  1. openrouter / nvidia/nemotron-3-super-120b-a12b:free [free/primary_free] score=54.85
+  2. openrouter / nvidia/nemotron-3-ultra-550b-a55b:free [free/free_fallback] score=39.9
+  3. openrouter / google/gemma-4-31b-it:free [free/free_fallback]
+  4. openrouter / deepseek/deepseek-v4-flash [paid/task_matched_paid]
+  9. openai-codex / gpt-5.5 [paid/final_paid_fallback]
+"""
+
+
+def test_parse_route_chain_parses_all_fields():
+    chain = harp_routing._parse_route_chain(_SAMPLE_ROUTE_CHAIN_OUTPUT)
+    assert len(chain) == 5
+    assert chain[0] == {
+        "rank": 1, "provider": "openrouter",
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+        "tier": "free", "role": "primary_free", "score": 54.85,
+    }
+    # Entries without a score= suffix parse with score=None, not a crash.
+    assert chain[3]["model"] == "deepseek/deepseek-v4-flash"
+    assert chain[3]["score"] is None
+    # Rank is read from the printed number, not just enumeration order.
+    assert chain[4]["rank"] == 9
+
+
+def test_parse_route_chain_no_header_returns_empty():
+    assert harp_routing._parse_route_chain("DECISION: free_first\nMODEL: x\n") == []
+
+
+def test_get_candidate_chain_disabled_returns_none():
+    assert harp_routing.get_candidate_chain({}) is None
+
+
+def test_get_candidate_chain_parses_subprocess_output(monkeypatch, tmp_path):
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_SAMPLE_ROUTE_CHAIN_OUTPUT, stderr="",
+        )
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", fake_run)
+    chain = harp_routing.get_candidate_chain(config, selector_path=selector)
+    assert chain is not None
+    assert len(chain) == 5
+    assert chain[0]["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
+
+
+def test_top_scoring_model_for_task_cross_references_against_live_chain(monkeypatch, tmp_path):
+    """The eval table's #1 pick ('delisted/dead-model') isn't in the live
+    ROUTE_CHAIN -- mirrors the real owl-alpha incident. Must skip it and
+    return the next eval candidate that IS live, not the raw top scorer."""
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+
+    def fake_execute(self, sql, params=()):
+        assert params == ("code_generation",)
+        self._next_rows = [("delisted/dead-model",), ("nvidia/nemotron-3-super-120b-a12b:free",)]
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_SAMPLE_ROUTE_CHAIN_OUTPUT, stderr="",
+        )
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", fake_run)
+
+    result = harp_routing.top_scoring_model_for_task(
+        "code_generation", config=config, selector_path=selector,
+    )
+    assert result == {"model": "nvidia/nemotron-3-super-120b-a12b:free", "provider": "openrouter"}
+
+
+def test_top_scoring_model_for_task_none_when_no_eval_candidate_is_live(monkeypatch, tmp_path):
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+
+    def fake_execute(self, sql, params=()):
+        self._next_rows = [("delisted/dead-model-1",), ("delisted/dead-model-2",)]
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_SAMPLE_ROUTE_CHAIN_OUTPUT, stderr="",
+        )
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", fake_run)
+
+    assert harp_routing.top_scoring_model_for_task(
+        "code_generation", config=config, selector_path=selector,
+    ) is None
+
+
+def test_top_scoring_model_for_task_none_when_chain_unavailable(monkeypatch, tmp_path):
+    """If the live chain can't be fetched at all (selector disabled/missing/
+    failed), cross-referencing must fail closed (None), not silently fall
+    back to the unverified raw top scorer."""
+    config = {"harp_routing": {"enabled": True}}
+    missing_selector = tmp_path / "does-not-exist.py"
+
+    def fake_execute(self, sql, params=()):
+        self._next_rows = [("some/model",)]
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+
+    assert harp_routing.top_scoring_model_for_task(
+        "code_generation", config=config, selector_path=missing_selector,
+    ) is None
+
+
+def test_top_scoring_model_for_task_no_config_unaffected_by_cross_referencing(monkeypatch):
+    """Original call shape (no config kwarg) must behave exactly as before
+    this feature -- no chain fetch, raw top scorer returned unchanged."""
+    def fake_execute(self, sql, params=()):
+        self._next_row = ("some/best-model:free",)
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+
+    def exploding_run(*_a, **_kw):
+        raise AssertionError("no config kwarg means no selector subprocess should run")
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", exploding_run)
+
+    assert harp_routing.top_scoring_model_for_task("code_review") == {
+        "model": "some/best-model:free", "provider": "openrouter",
+    }
 
 
 def test_status_summary_disabled():
