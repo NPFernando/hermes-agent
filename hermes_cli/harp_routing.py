@@ -124,6 +124,15 @@ def select_route(
     Cached briefly per (selector, task, risk) — see ``DEFAULT_CACHE_TTL_SECONDS``
     / ``harp_routing.cache_ttl_seconds`` in config.yaml. Set the config key to
     ``0`` to disable caching entirely.
+
+    Note: ``harp-select-route.py`` only accepts ``--task``/``--risk``/
+    ``--allow-review-only``/``--json`` (confirmed via ``--help``) — there is
+    no ``--data-class``/``--action-mode`` flag to pass through, unlike the
+    broader ``harp_universal.contracts.TaskRequest`` schema used elsewhere in
+    the universal-harp-engine repo. Callers needing data-class/action-mode as
+    *policy* context (not selector input) should carry them separately — see
+    ``plan_delegation_route()``, which accepts them for shadow-mode logging
+    without forwarding anything unsupported to this subprocess call.
     """
     if not is_enabled(config):
         return None
@@ -166,6 +175,48 @@ def select_route(
             _cache[cache_key] = (now, result)
 
     return result
+
+
+def plan_delegation_route(
+    config: dict[str, Any] | None,
+    *,
+    goal_text: str | None = None,
+    data_class: str = "internal",
+    action_mode: str = "write",
+    risk: str = "standard",
+    selector_path: Path | None = None,
+) -> dict[str, Any]:
+    """Shadow/enforce-mode routing plan for a ``delegate_task`` child.
+
+    Thin wrapper around ``classify_task()`` + ``select_route()`` for the
+    delegation boundary (``tools/delegate_tool.py``) — distinct from the
+    gateway's per-message hook, but reuses the same classifier, selector
+    subprocess call, cache, and fail-open semantics rather than duplicating
+    them. ``data_class``/``action_mode`` are carried as policy/logging
+    context only (see ``select_route()``'s docstring — the underlying
+    selector script has no such flags to receive them).
+
+    Always returns a dict, never raises — same fail-open contract as
+    ``select_route()``. ``fallback_mode`` is ``"explicit_route"`` when a
+    route was found, ``"inherit_parent"`` otherwise (disabled, selector
+    failed, or no route available) — callers in shadow mode should always
+    behave as if they saw ``"inherit_parent"`` regardless of this value;
+    only ``enforce`` mode (not yet implemented — Phase 2) should act on
+    ``"explicit_route"``.
+    """
+    task = classify_task(goal_text)
+    try:
+        route = select_route(config, task=task, risk=risk, selector_path=selector_path)
+    except Exception:
+        route = None
+    return {
+        "task": task,
+        "risk": risk,
+        "data_class": data_class,
+        "action_mode": action_mode,
+        "route": route,
+        "fallback_mode": "explicit_route" if route else "inherit_parent",
+    }
 
 
 def status_summary(

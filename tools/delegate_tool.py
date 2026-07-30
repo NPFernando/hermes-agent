@@ -2509,6 +2509,28 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
+    # Optional HARP-informed routing plan — shadow mode only (Phase 1): logs
+    # a classification/route recommendation but never changes credentials.
+    # "enforce" mode (actually using the plan) is not implemented yet. Fully
+    # opt-in (default delegation.routing.mode: inherit_parent) and fail-open —
+    # any error here is swallowed, never affects delegation itself.
+    try:
+        _routing_cfg = cfg.get("delegation", {}).get("routing", {}) if isinstance(cfg, dict) else {}
+        _routing_mode = _routing_cfg.get("mode", "inherit_parent") if isinstance(_routing_cfg, dict) else "inherit_parent"
+        if _routing_mode in ("shadow", "enforce"):
+            from hermes_cli.harp_routing import plan_delegation_route
+
+            _shadow_goal = goal or (tasks[0].get("goal") if tasks and isinstance(tasks, list) and tasks and isinstance(tasks[0], dict) else None)
+            _harp_plan = plan_delegation_route(cfg, goal_text=_shadow_goal)
+            logger.info(
+                "delegate_task harp_routing shadow plan: mode=%s task=%s risk=%s "
+                "fallback_mode=%s route=%s",
+                _routing_mode, _harp_plan["task"], _harp_plan["risk"],
+                _harp_plan["fallback_mode"], _harp_plan["route"],
+            )
+    except Exception as _harp_shadow_exc:
+        logger.debug("delegate_task harp_routing shadow plan failed (non-fatal): %r", _harp_shadow_exc)
+
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system

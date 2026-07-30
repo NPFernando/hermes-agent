@@ -209,3 +209,49 @@ def test_failure_is_also_cached(monkeypatch, tmp_path):
     assert harp_routing.select_route(config, selector_path=selector) is None
     assert harp_routing.select_route(config, selector_path=selector) is None
     assert call_count["n"] == 1, "a failure should also be cached, not retried on every message"
+
+
+def test_plan_delegation_route_disabled_returns_inherit_parent():
+    plan = harp_routing.plan_delegation_route({}, goal_text="write a function to sort a list")
+    assert plan["route"] is None
+    assert plan["fallback_mode"] == "inherit_parent"
+    assert plan["task"] == "code_generation"  # classification still happens even when disabled
+
+
+def test_plan_delegation_route_classifies_and_carries_policy_context(monkeypatch, tmp_path):
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="MODEL: nemotron-free\nPROVIDER: openrouter\n", stderr="",
+        )
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", fake_run)
+    plan = harp_routing.plan_delegation_route(
+        config, goal_text="I'm getting a traceback, please fix this bug",
+        data_class="confidential", action_mode="review", risk="high_risk",
+        selector_path=selector,
+    )
+    assert plan["task"] == "debugging"
+    assert plan["risk"] == "high_risk"
+    assert plan["data_class"] == "confidential"
+    assert plan["action_mode"] == "review"
+    assert plan["route"] == {"model": "nemotron-free", "provider": "openrouter"}
+    assert plan["fallback_mode"] == "explicit_route"
+
+
+def test_plan_delegation_route_never_raises_on_selector_failure(monkeypatch, tmp_path):
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+
+    def exploding_run(*_args, **_kwargs):
+        raise RuntimeError("simulated selector crash")
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", exploding_run)
+    plan = harp_routing.plan_delegation_route(config, goal_text="hello", selector_path=selector)
+    assert plan["fallback_mode"] == "inherit_parent"
+    assert plan["route"] is None

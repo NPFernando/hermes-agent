@@ -2408,6 +2408,15 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Optional HARP-informed routing for delegate_task children (see
+        # hermes_cli/harp_routing.py::plan_delegation_route). Disabled by
+        # default — "inherit_parent" preserves today's behavior exactly
+        # (empty delegation.model/provider above -> child inherits parent).
+        # "shadow" computes and logs a routing plan without changing
+        # credentials. "enforce" is not implemented yet (Phase 2).
+        "routing": {
+            "mode": "inherit_parent",  # inherit_parent | shadow | enforce
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
