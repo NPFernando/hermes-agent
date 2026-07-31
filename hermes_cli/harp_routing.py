@@ -334,14 +334,28 @@ def plan_delegation_route(
     route was found, ``"inherit_parent"`` otherwise (disabled, selector
     failed, or no route available) — callers in shadow mode should always
     behave as if they saw ``"inherit_parent"`` regardless of this value;
-    only ``enforce`` mode (not yet implemented — Phase 2) should act on
-    ``"explicit_route"``.
+    only ``enforce`` mode should act on ``"explicit_route"``.
+
+    ``top_scoring_model`` is the cross-referenced per-category eval-score
+    pick (``top_scoring_model_for_task()`` with ``config=`` set, so it's
+    already checked against the live candidate chain — never a delisted
+    model). Purely informational in both shadow and enforce mode; ``None``
+    when no eval data exists for the task or nothing eval-ranked is
+    currently live. Computed here (not left to individual callers) so
+    shadow-mode plans carry the same signal enforce-mode logging already
+    did, instead of only enforce mode seeing it.
     """
     task = classify_task(goal_text)
     try:
         route = select_route(config, task=task, risk=risk, selector_path=selector_path)
     except Exception:
         route = None
+    try:
+        top_scoring_model = top_scoring_model_for_task(
+            task, config=config, risk=risk, selector_path=selector_path,
+        )
+    except Exception:
+        top_scoring_model = None
     return {
         "task": task,
         "risk": risk,
@@ -349,6 +363,7 @@ def plan_delegation_route(
         "action_mode": action_mode,
         "route": route,
         "fallback_mode": "explicit_route" if route else "inherit_parent",
+        "top_scoring_model": top_scoring_model,
     }
 
 

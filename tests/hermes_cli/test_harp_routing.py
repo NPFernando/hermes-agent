@@ -557,3 +557,33 @@ def test_plan_delegation_route_never_raises_on_selector_failure(monkeypatch, tmp
     plan = harp_routing.plan_delegation_route(config, goal_text="hello", selector_path=selector)
     assert plan["fallback_mode"] == "inherit_parent"
     assert plan["route"] is None
+
+
+def test_plan_delegation_route_carries_cross_referenced_top_scoring_model(monkeypatch, tmp_path):
+    """plan_delegation_route()'s top_scoring_model field must be the
+    cross-referenced pick (config= passed through internally), so shadow
+    mode gets the same dead-model-filtered signal enforce mode's logging
+    already relied on -- not a raw, possibly-delisted eval-table pick."""
+    config = {"harp_routing": {"enabled": True}}
+    selector = tmp_path / "harp-select-route.py"
+    selector.write_text("#!/usr/bin/env python3\n")
+
+    def fake_execute(self, sql, params=()):
+        self._next_rows = [("delisted/dead-model",), ("nvidia/nemotron-3-super-120b-a12b:free",)]
+        return self
+
+    monkeypatch.setattr(_FakeCursor, "execute", fake_execute)
+    monkeypatch.setattr(harp_routing, "_harp_pg_connect", lambda: _FakeConn({}))
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=_SAMPLE_ROUTE_CHAIN_OUTPUT, stderr="",
+        )
+
+    monkeypatch.setattr(harp_routing.subprocess, "run", fake_run)
+    plan = harp_routing.plan_delegation_route(
+        config, goal_text="write a function that sorts a list", selector_path=selector,
+    )
+    assert plan["top_scoring_model"] == {
+        "model": "nvidia/nemotron-3-super-120b-a12b:free", "provider": "openrouter",
+    }
