@@ -483,6 +483,12 @@ export default function App() {
       data-layout-variant={layoutVariant}
       className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black text-text-primary antialiased"
     >
+      <a
+        className="sr-only fixed top-3 left-3 z-[60] rounded-md bg-background-base px-4 py-2 text-sm font-medium text-midground shadow-lg ring-2 ring-midground focus:not-sr-only focus:outline-none"
+        href="#main-content"
+      >
+        {t.app.skipToMainContent ?? "Skip to main content"}
+      </a>
       <SelectionSwitcher />
       <Backdrop />
       <PluginSlot name="backdrop" />
@@ -726,7 +732,9 @@ export default function App() {
               )}
             >
               <PluginSlot name="pre-main" />
-              <div
+              <main
+                id="main-content"
+                tabIndex={-1}
                 className={cn(
                   "w-full min-w-0",
                   !isChatRoute &&
@@ -776,7 +784,7 @@ export default function App() {
                       <ChatPage isActive={isChatRoute} />
                     </div>
                   ))}
-              </div>
+              </main>
               <PluginSlot name="post-main" />
             </div>
           </PageHeaderProvider>

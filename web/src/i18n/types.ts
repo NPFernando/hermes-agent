@@ -107,6 +107,8 @@ export interface Translations {
     openNavigation: string;
     pluginNavSection: string;
     sessionsActiveCount: string;
+    /** Optional — falls back to English until translated. */
+    skipToMainContent?: string;
     statusOverview: string;
     system: string;
     webUi: string;
