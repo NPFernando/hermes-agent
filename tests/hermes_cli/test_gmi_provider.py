@@ -118,6 +118,10 @@ class TestGmiModelCatalog:
             },
         )
         monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda api_key, base_url: None)
+        # Keep this test on the static fallback path. The generic provider
+        # profile can independently query /models, which makes this assertion
+        # depend on GMI's live catalog and can return a different model list.
+        monkeypatch.setattr("providers.get_provider_profile", lambda provider_id: None)
 
         assert provider_model_ids("gmi") == list(_PROVIDER_MODELS["gmi"])
 
