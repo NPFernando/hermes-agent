@@ -9616,10 +9616,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if goal:
             # Write plan to .hermes/plans/ and open it
             plan_dir = os.path.join(os.path.expanduser("~"), ".hermes", "plans")
-            os.makedirs(plan_dir, exist_ok=True)
+            os.makedirs(plan_dir, mode=0o700, exist_ok=True)
             ts = time.strftime("%Y%m%d-%H%M%S")
-            plan_path = os.path.join(plan_dir, f"plan-{ts}.md")
-            with open(plan_path, "w", encoding="utf-8") as f:
+            fd, plan_path = tempfile.mkstemp(
+                prefix=f"plan-{ts}-", suffix=".md", dir=plan_dir, text=True
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(f"# Plan: {goal}\n\n## Goal\n{goal}\n\n## Steps\n1. \n2. \n3. \n\n## Verification\n- \n")
             _cprint(f"  📋 Plan created: {plan_path}")
             _cprint(f"  💡 Edit the file, then use /goal to start working on it")
@@ -9707,18 +9709,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             import subprocess
             # Try TypeScript first
             if os.path.exists(os.path.join(target, "tsconfig.json")) or os.path.exists(os.path.join(target, "package.json")):
-                result = subprocess.run(
-                    ["npx", "tsc", "--noEmit"],
-                    capture_output=True, text=True, timeout=60, cwd=target
-                )
-                if result.returncode == 0:
-                    _cprint(f"  ✅ TypeScript: no errors")
+                root = os.path.abspath(target)
+                local_tsc = None
+                current = root
+                while True:
+                    candidate = os.path.join(current, "node_modules", "typescript", "bin", "tsc")
+                    if os.path.isfile(candidate):
+                        local_tsc = candidate
+                        break
+                    parent = os.path.dirname(current)
+                    if parent == current:
+                        break
+                    current = parent
+                if local_tsc is None:
+                    _cprint("  ℹ TypeScript check skipped: local TypeScript is not installed")
                 else:
-                    lines = result.stdout.splitlines()[:15]
-                    for line in lines:
-                        _cprint(f"  ⚠ {line}")
-                    if len(result.stdout.splitlines()) > 15:
-                        _cprint(f"  ... and {len(result.stdout.splitlines()) - 15} more")
+                    result = subprocess.run(
+                        ["node", local_tsc, "--noEmit"],
+                        capture_output=True, text=True, timeout=60, cwd=target
+                    )
+                    if result.returncode == 0:
+                        _cprint("  ✅ TypeScript: no errors")
+                    else:
+                        lines = result.stdout.splitlines()[:15]
+                        for line in lines:
+                            _cprint(f"  ⚠ {line}")
+                        if len(result.stdout.splitlines()) > 15:
+                            _cprint(f"  ... and {len(result.stdout.splitlines()) - 15} more")
             # Try Python
             if os.path.exists(os.path.join(target, "pyproject.toml")) or os.path.exists(os.path.join(target, "setup.py")):
                 result = subprocess.run(

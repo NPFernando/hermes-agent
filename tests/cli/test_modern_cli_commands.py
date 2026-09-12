@@ -92,3 +92,57 @@ def test_log_command_clamps_nonpositive_limit(monkeypatch):
     HermesCLI._handle_log_command(SimpleNamespace(), "/log -10")
 
     assert calls[0][2] == "--max-count=1"
+
+
+def test_plan_command_creates_unique_private_files_without_overwriting(monkeypatch, tmp_path):
+    import os
+
+    home = tmp_path / "home"
+    monkeypatch.setattr("cli.os.path.expanduser", lambda value: str(home) if value == "~" else value)
+    monkeypatch.setattr("cli.time.strftime", lambda _fmt: "20260913-020000")
+    monkeypatch.setattr("cli._cprint", lambda message, **kwargs: None)
+
+    HermesCLI._handle_plan_command(SimpleNamespace(), "/plan first secret goal")
+    HermesCLI._handle_plan_command(SimpleNamespace(), "/plan second secret goal")
+
+    plans = sorted((home / ".hermes" / "plans").glob("plan-*.md"))
+    assert len(plans) == 2
+    contents = {plan.read_text(encoding="utf-8") for plan in plans}
+    assert any("first secret goal" in content for content in contents)
+    assert any("second secret goal" in content for content in contents)
+    if os.name == "posix":
+        assert all(plan.stat().st_mode & 0o077 == 0 for plan in plans)
+
+
+def test_check_command_never_runs_npx_when_local_typescript_is_missing(monkeypatch, tmp_path):
+    import subprocess
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.json").write_text("{}", encoding="utf-8")
+    run = Mock()
+    monkeypatch.setattr(subprocess, "run", run)
+    printed = []
+    monkeypatch.setattr("cli._cprint", lambda message, **kwargs: printed.append(str(message)))
+
+    HermesCLI._handle_check_command(SimpleNamespace(), f"/check {project}")
+
+    run.assert_not_called()
+    assert "local TypeScript is not installed" in "\n".join(printed)
+
+
+def test_check_command_uses_only_local_typescript(monkeypatch, tmp_path):
+    import subprocess
+
+    project = tmp_path / "project"
+    tsc = project / "node_modules" / "typescript" / "bin" / "tsc"
+    tsc.parent.mkdir(parents=True)
+    tsc.write_text("", encoding="utf-8")
+    (project / "package.json").write_text("{}", encoding="utf-8")
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("cli._cprint", lambda message, **kwargs: None)
+
+    HermesCLI._handle_check_command(SimpleNamespace(), f"/check {project}")
+
+    assert run.call_args.args[0] == ["node", str(tsc), "--noEmit"]
