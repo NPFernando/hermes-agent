@@ -2,7 +2,10 @@
 
 import os
 import json
+import hashlib
+import hmac
 import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -243,6 +246,940 @@ class TestWebServerEndpoints:
         assert "version" in data
         assert "hermes_home" in data
         assert "active_sessions" in data
+
+    def test_get_harp_status_with_filters(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        status_file = get_hermes_home() / "harp-routing-status.json"
+        status_file.write_text(
+            json.dumps(
+                {
+                    "status": {"state": "applied", "provider": "openai-codex"},
+                    "history": [
+                        {"decision_id": "d1", "state": "failed", "provider": "openrouter", "timestamp": 10.0},
+                        {"decision_id": "d2", "state": "applied", "provider": "openai-codex", "timestamp": 20.0},
+                    ],
+                    "alerts": [
+                        {
+                            "audit_id": "a1",
+                            "severity": "warning",
+                            "message": "w",
+                            "timestamp": 11.0,
+                            "webhook_status": "failed",
+                        },
+                        {
+                            "audit_id": "a2",
+                            "severity": "critical",
+                            "message": "c",
+                            "timestamp": 21.0,
+                            "webhook_status": "sent",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {"harp_routing": {"enabled": True, "alert_webhook_secret": "secret"}},
+        )
+
+        resp = self.client.get(
+            "/api/harp-status",
+            params={"tail": 5, "since": 15, "severity": "critical"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is True
+        assert data["status"]["state"] == "applied"
+        assert len(data["history"]) == 1
+        assert data["history"][0]["provider"] == "openai-codex"
+        assert len(data["alerts"]) == 1
+        assert data["alerts"][0]["severity"] == "critical"
+        assert data["webhook_metrics"]["attempted"] == 1
+        assert data["webhook_metrics"]["sent"] == 1
+        assert data["webhook_metrics"]["failed"] == 0
+        assert "last_1h" in data["webhook_metrics"]["windows"]
+        assert "last_24h" in data["webhook_metrics"]["windows"]
+
+        resp = self.client.get(
+            "/api/harp-status",
+            params={"tail": 5, "since_id": "d1"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["history"]) == 1
+        assert data["history"][0]["decision_id"] == "d2"
+
+        export_csv = self.client.get(
+            "/api/harp-status/export",
+            params={"format": "csv", "tail": 5},
+        )
+        assert export_csv.status_code == 200
+        assert "attachment; filename=" in export_csv.headers.get("content-disposition", "")
+        assert "type,timestamp,state_or_severity" in export_csv.text
+        assert export_csv.headers.get("x-harp-export-generated-at")
+        assert export_csv.headers.get("x-harp-export-checksum-sha256")
+        assert str(export_csv.headers.get("x-harp-export-signature", "")).startswith("sha256=")
+
+        export_csv_min = self.client.get(
+            "/api/harp-status/export",
+            params={"format": "csv", "columns": "minimal", "tail": 5},
+        )
+        assert export_csv_min.status_code == 200
+        assert export_csv_min.text.splitlines()[0] == "type,timestamp,state_or_severity,message"
+
+        monkeypatch.setattr("hermes_cli.web_server.time.time", lambda: 30.0)
+        metrics = self.client.get(
+            "/api/harp-status/metrics",
+            params={
+                "window_hours": 24,
+                "failed_delta_warning_threshold": 1,
+                "failed_delta_info_threshold": 1,
+                "failed_delta_warn_threshold": 1,
+                "failed_delta_critical_threshold": 2,
+            },
+        )
+        assert metrics.status_code == 200
+        m = metrics.json()
+        assert m["window_hours"] == 24
+        assert m["bucket"] == "1h"
+        assert isinstance(m["series"], list)
+        assert {"bucket_start", "attempted", "sent", "failed", "success_ratio"} <= set(m["series"][-1].keys())
+        assert "reliability" in m
+        assert "failure_streak" in m["reliability"]
+        assert "windows" in m["reliability"]
+        assert "last_1h" in m["reliability"]["windows"]
+        assert "last_24h" in m["reliability"]["windows"]
+        assert "deltas" in m["reliability"]
+        assert "last_1h_vs_prev_1h" in m["reliability"]["deltas"]
+        assert m["reliability"]["deltas"]["last_1h_vs_prev_1h"]["warning"] is True
+        assert m["reliability"]["deltas"]["last_1h_vs_prev_1h"]["severity"] == "warn"
+        assert "breach_counters" in m["reliability"]["deltas"]["last_1h_vs_prev_1h"]
+        assert "last_breach_ts" in m["reliability"]["deltas"]["last_1h_vs_prev_1h"]
+        metrics_5m = self.client.get(
+            "/api/harp-status/metrics",
+            params={"window_hours": 1, "bucket": "5m"},
+        )
+        assert metrics_5m.status_code == 200
+        assert metrics_5m.json()["bucket"] == "5m"
+
+        # Cooldown/hysteresis: keep previous higher severity during cooldown.
+        monkeypatch.setattr("hermes_cli.web_server.time.time", lambda: 30.0)
+        warm = self.client.get(
+            "/api/harp-status/metrics",
+            params={
+                "window_hours": 24,
+                "failed_delta_warn_threshold": 1,
+                "severity_cooldown_seconds": 5000,
+                "severity_state_key": "test-key",
+            },
+        )
+        assert warm.status_code == 200
+        assert warm.json()["reliability"]["deltas"]["last_1h_vs_prev_1h"]["severity"] == "warn"
+
+        monkeypatch.setattr("hermes_cli.web_server.time.time", lambda: 4000.0)
+        cooled = self.client.get(
+            "/api/harp-status/metrics",
+            params={
+                "window_hours": 24,
+                "failed_delta_warn_threshold": 1,
+                "severity_cooldown_seconds": 5000,
+                "severity_state_key": "test-key",
+            },
+        )
+        assert cooled.status_code == 200
+        delta = cooled.json()["reliability"]["deltas"]["last_1h_vs_prev_1h"]
+        assert delta["severity_raw"] == "none"
+        assert delta["severity"] == "warn"
+        reset_one = self.client.post(
+            "/api/harp-status/severity-state/reset",
+            params={"severity_state_key": "test-key"},
+        )
+        assert reset_one.status_code == 200
+        assert reset_one.json()["scope"] == "key"
+
+    def test_harp_export_signature_uses_env_override_secret(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        status_file = get_hermes_home() / "harp-routing-status.json"
+        status_file.write_text(
+            json.dumps(
+                {
+                    "status": {"state": "applied"},
+                    "history": [],
+                    "alerts": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "enabled": True,
+                    "alert_export_signing_secret": "config-secret",
+                    "alert_export_signing_key_id": "kid-config",
+                    "alert_export_signing_key_version": "v2",
+                    "alert_export_signing_key_deprecated": True,
+                    "alert_export_signing_not_before": "2026-08-01T00:00:00Z",
+                    "alert_export_signing_sunset_at": "2026-12-31T23:59:59Z",
+                    "severity_reset_compaction_auto_backoff_enabled": True,
+                    "severity_reset_compaction_auto_backoff_trigger_count": 1,
+                    "severity_reset_compaction_auto_backoff_window_seconds": 1800,
+                    "severity_reset_compaction_auto_backoff_seconds": 600,
+                    "severity_reset_compaction_backoff_notify_enabled": True,
+                    "severity_reset_compaction_backoff_notify_dedupe_seconds": 300,
+                    "severity_reset_unmute_allowed_reasons": ["manual-test"],
+                    "severity_reset_unmute_reason_redact_regex": "manual",
+                    "severity_reset_verify_allowed_verifiers": ["ops-audit"],
+                    "severity_reset_verify_nonce_alert_threshold": 1,
+                    "severity_reset_verify_nonce_alert_window_seconds": 600,
+                    "severity_reset_verify_verifier_auto_lock_enabled": True,
+                    "severity_reset_verify_verifier_auto_lock_threshold": 1,
+                    "severity_reset_verify_verifier_auto_lock_window_seconds": 3600,
+                    "severity_reset_verify_verifier_lock_seconds": 1800,
+                    "severity_reset_verify_unlock_allowed_reasons": ["manual-test"],
+                }
+            },
+        )
+        monkeypatch.setenv("HARP_EXPORT_SIGNING_SECRET", "env-secret")
+
+        resp = self.client.get("/api/harp-status/export", params={"format": "json"})
+        assert resp.status_code == 200
+        generated = resp.headers.get("x-harp-export-generated-at")
+        checksum = resp.headers.get("x-harp-export-checksum-sha256")
+        signature = resp.headers.get("x-harp-export-signature")
+        assert generated and checksum and signature
+        expected = "sha256=" + hmac.new(
+            b"env-secret",
+            f"{generated}:{checksum}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        assert signature == expected
+        assert resp.headers.get("x-harp-export-key-id") == "kid-config"
+        assert resp.headers.get("x-harp-export-key-alg") == "hmac-sha256"
+        assert resp.headers.get("x-harp-export-key-version") == "v2"
+        assert resp.headers.get("x-harp-export-key-deprecated") == "true"
+        assert resp.headers.get("x-harp-export-key-not-before") == "2026-08-01T00:00:00Z"
+        assert resp.headers.get("x-harp-export-key-sunset-at") == "2026-12-31T23:59:59Z"
+
+    def test_harp_export_rejects_invalid_timeline(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "enabled": True,
+                    "alert_export_signing_secret": "s",
+                    "alert_export_signing_not_before": "2026-12-31T00:00:00Z",
+                    "alert_export_signing_sunset_at": "2026-01-01T00:00:00Z",
+                }
+            },
+        )
+        resp = self.client.get("/api/harp-status/export", params={"format": "json"})
+        assert resp.status_code == 400
+        assert "Invalid key timeline" in resp.text
+        lint = self.client.get("/api/harp-status/lint")
+        assert lint.status_code == 200
+        lint_data = lint.json()
+        assert lint_data["ok"] is False
+        assert any("sunset_at is earlier than not_before" in msg for msg in lint_data["issues"])
+
+    def test_harp_lint_strict_escalates_warnings(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "enabled": True,
+                    "alert_export_signing_key_version": "v1",
+                    "alert_export_signing_key_deprecated": True,
+                }
+            },
+        )
+        loose = self.client.get("/api/harp-status/lint", params={"strict": "false"})
+        assert loose.status_code == 200
+        loose_data = loose.json()
+        assert loose_data["ok"] is True
+        assert loose_data["warnings"]
+
+        strict = self.client.get("/api/harp-status/lint", params={"strict": "true"})
+        assert strict.status_code == 200
+        strict_data = strict.json()
+        assert strict_data["ok"] is False
+        assert strict_data["strict"] is True
+        assert strict_data["escalated_warnings"] >= 1
+        assert "deprecated_without_sunset" in (strict_data.get("reason_codes") or [])
+        history = self.client.get("/api/harp-status/lint-history", params={"tail": 5})
+        assert history.status_code == 200
+        assert isinstance(history.json()["history"], list)
+
+    def test_harp_severity_reset_enforces_actor_allowlist(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "severity_reset_admin_tags": ["ops-admin"],
+                    "severity_reset_audit_size": 50,
+                    "severity_reset_reason_deny_regex": "forbidden",
+                    "severity_reset_allowed_reasons": ["incident-mitigation", "manual-test"],
+                }
+            },
+        )
+        denied = self.client.post(
+            "/api/harp-status/severity-state/reset",
+            params={"severity_state_key": "x", "actor_tag": "viewer", "reason": "test"},
+        )
+        assert denied.status_code == 403
+        allowed = self.client.post(
+            "/api/harp-status/severity-state/reset",
+            params={"severity_state_key": "x", "actor_tag": "ops-admin", "reason": "incident-mitigation"},
+        )
+        assert allowed.status_code == 200
+        denied_taxonomy = self.client.post(
+            "/api/harp-status/severity-state/reset",
+            params={"severity_state_key": "x", "actor_tag": "ops-admin", "reason": "unknown-reason"},
+        )
+        assert denied_taxonomy.status_code == 400
+        denied_reason = self.client.post(
+            "/api/harp-status/severity-state/reset",
+            params={"severity_state_key": "x", "actor_tag": "ops-admin", "reason": "forbidden text"},
+        )
+        assert denied_reason.status_code == 400
+        audit = self.client.get("/api/harp-status/severity-reset-audit", params={"tail": 5})
+        assert audit.status_code == 200
+        assert isinstance(audit.json()["audit"], list)
+        only_denied = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"tail": 5, "allowed": "false", "actor": "ops-admin"},
+        )
+        assert only_denied.status_code == 200
+        assert all(row.get("allowed") is False for row in only_denied.json()["audit"])
+
+    def test_harp_severity_reset_audit_sort_cursor_and_reason_visibility(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        status_file = get_hermes_home() / "harp-routing-status.json"
+        status_file.write_text(
+            json.dumps(
+                {
+                    "severity_reset_audit": [
+                        {
+                            "audit_id": "a1",
+                            "timestamp": 10.0,
+                            "allowed": True,
+                            "actor_tag": "ops-admin",
+                            "reason": "first-reason",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 1,
+                        },
+                        {
+                            "audit_id": "a2",
+                            "timestamp": 20.0,
+                            "allowed": False,
+                            "actor_tag": "ops-admin",
+                            "reason": "second-reason",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 0,
+                        },
+                        {
+                            "audit_id": "a3",
+                            "timestamp": 30.0,
+                            "allowed": True,
+                            "actor_tag": "ops-admin",
+                            "reason": "third-reason",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 2,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "severity_reset_reason_privileged_tags": ["ops-admin"],
+                    "severity_reset_reason_partial_tags": ["ops-analyst"],
+                    "severity_reset_reason_preview_chars": 6,
+                    "severity_reset_cursor_signing_secret": "cursor-secret",
+                }
+            },
+        )
+
+        newest = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"limit": 2, "sort": "newest"},
+        )
+        assert newest.status_code == 200
+        newest_data = newest.json()
+        assert [row["timestamp"] for row in newest_data["audit"]] == [30.0, 20.0]
+        assert newest_data["next_cursor"] == 20.0
+        assert newest_data["next_cursor_token"]
+        assert newest_data["has_more"] is True
+        assert newest_data["total_estimate"] == 3
+
+        next_page = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"limit": 2, "sort": "newest", "cursor_token": newest_data["next_cursor_token"]},
+        )
+        assert next_page.status_code == 200
+        next_page_data = next_page.json()
+        assert [row["timestamp"] for row in next_page_data["audit"]] == [10.0]
+        assert next_page_data["has_more"] is False
+        assert next_page_data["next_cursor_token"] is None
+        tampered = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"limit": 2, "sort": "newest", "cursor_token": f"{newest_data['next_cursor_token']}x"},
+        )
+        assert tampered.status_code == 400
+
+        oldest = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"limit": 2, "sort": "oldest"},
+        )
+        assert oldest.status_code == 200
+        assert [row["timestamp"] for row in oldest.json()["audit"]] == [10.0, 20.0]
+
+        masked = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"limit": 1, "viewer_tag": "dashboard"},
+        )
+        assert masked.status_code == 200
+        masked_row = masked.json()["audit"][0]
+        assert masked_row["reason"] == "[MASKED]"
+        assert masked_row["reason_masked"] is True
+
+        partial = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"limit": 1, "viewer_tag": "ops-analyst"},
+        )
+        assert partial.status_code == 200
+        partial_row = partial.json()["audit"][0]
+        assert partial_row["reason"].startswith("third-")
+        assert partial_row["reason"].endswith("…[MASKED]")
+        assert partial_row["reason_masked"] is True
+
+        unmasked = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"limit": 1, "viewer_tag": "ops-admin"},
+        )
+        assert unmasked.status_code == 200
+        assert unmasked.json()["audit"][0]["reason"] == "third-reason"
+        assert unmasked.json()["reason_visibility"] == "full"
+
+    def test_harp_ops_snapshot_export(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        status_file = get_hermes_home() / "harp-routing-status.json"
+        status_file.write_text(
+            json.dumps(
+                {
+                    "severity_reset_audit": [
+                        {
+                            "timestamp": 1.0,
+                            "allowed": True,
+                            "actor_tag": "ops",
+                            "reason": "token=abc123",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 1,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "alert_export_signing_secret": "ops-secret",
+                    "alert_export_signing_key_id": "ops-kid",
+                    "alert_export_signing_key_version": "v9",
+                    "severity_reset_reason_redact_regex": "abc123",
+                }
+            },
+        )
+        resp = self.client.get(
+            "/api/harp-status/ops-snapshot/export",
+            params={"format": "json", "tail": 10},
+        )
+        assert resp.status_code == 200
+        assert "attachment; filename=" in resp.headers.get("content-disposition", "")
+        assert str(resp.headers.get("x-harp-export-signature", "")).startswith("sha256=")
+        assert resp.headers.get("x-harp-export-key-id") == "ops-kid"
+        assert "abc123" not in resp.text
+        assert "[REDACTED]" in resp.text
+
+    def test_harp_severity_reset_audit_rejects_invalid_cursor_token(self):
+        resp = self.client.get(
+            "/api/harp-status/severity-reset-audit",
+            params={"cursor_token": "not-a-valid-token"},
+        )
+        assert resp.status_code == 400
+
+    def test_harp_severity_reset_audit_partitions_retention(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        status_file = get_hermes_home() / "harp-routing-status.json"
+        old_ts = time.time() - (40 * 86400)
+        status_file.write_text(
+            json.dumps(
+                {
+                    "severity_reset_audit_partitions": {
+                        "2026-01-01": [
+                            {
+                                "audit_id": "old-1",
+                                "timestamp": old_ts,
+                                "allowed": True,
+                                "actor_tag": "ops-admin",
+                                "reason": "old",
+                                "scope": "all",
+                                "key": "",
+                                "removed": 1,
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "severity_reset_admin_tags": ["ops-admin"],
+                    "severity_reset_audit_retention_days": 30,
+                    "severity_reset_audit_size": 50,
+                }
+            },
+        )
+
+        reset_resp = self.client.post(
+            "/api/harp-status/severity-state/reset",
+            params={"actor_tag": "ops-admin", "reason": "incident-mitigation"},
+        )
+        assert reset_resp.status_code == 200
+        store = json.loads(status_file.read_text(encoding="utf-8"))
+        assert isinstance(store.get("severity_reset_audit_partitions"), dict)
+        flat = store.get("severity_reset_audit") or []
+        assert all(str(item.get("audit_id")) != "old-1" for item in flat)
+
+    def test_harp_severity_reset_audit_stats_and_compact(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        status_file = get_hermes_home() / "harp-routing-status.json"
+        now = time.time()
+        status_file.write_text(
+            json.dumps(
+                {
+                    "severity_reset_audit": [
+                        {
+                            "timestamp": now - 60,
+                            "allowed": True,
+                            "actor_tag": "ops-admin",
+                            "reason": "ok",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 1,
+                        },
+                        {
+                            "timestamp": now - 120,
+                            "allowed": False,
+                            "actor_tag": "ops-viewer",
+                            "reason": "denied",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 0,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "severity_reset_audit_size": 50,
+                    "severity_reset_audit_retention_days": 30,
+                    "severity_reset_admin_tags": ["ops-admin"],
+                    "severity_reset_compaction_alerts_retention_days": 30,
+                    "severity_reset_ops_signing_secret": "ops-sign",
+                    "severity_reset_ops_signing_key_id": "ops-k1",
+                }
+            },
+        )
+
+        stats_denied = self.client.get("/api/harp-status/severity-reset-audit/stats", params={"window_hours": 24})
+        assert stats_denied.status_code == 403
+        stats = self.client.get(
+            "/api/harp-status/severity-reset-audit/stats",
+            params={"window_hours": 24, "window_bucket": "1m", "actor_tag": "ops-admin"},
+        )
+        assert stats.status_code == 200
+        stats_data = stats.json()
+        assert stats_data["totals"]["total"] >= 2
+        assert stats_data["totals"]["allowed"] >= 1
+        assert stats_data["totals"]["denied"] >= 1
+        assert isinstance(stats_data.get("series"), list)
+        assert stats.headers.get("x-harp-reset-audit-signature", "").startswith("sha256=")
+        assert stats.headers.get("x-harp-reset-audit-key-id") == "ops-k1"
+
+        compact_denied = self.client.post("/api/harp-status/severity-reset-audit/compact", params={"dry_run": "false"})
+        assert compact_denied.status_code == 403
+        compact = self.client.post(
+            "/api/harp-status/severity-reset-audit/compact",
+            params={"dry_run": "false", "actor_tag": "ops-admin"},
+        )
+        assert compact.status_code == 200
+        compact_data = compact.json()
+        assert compact_data["ok"] is True
+        assert compact_data["partitions"] >= 1
+        assert compact.headers.get("x-harp-reset-audit-signature", "").startswith("sha256=")
+
+        timeline = self.client.get(
+            "/api/harp-status/severity-reset-audit/compaction-audit",
+            params={"tail": 10, "actor_tag": "ops-admin", "trigger": "manual"},
+        )
+        assert timeline.status_code == 200
+        rows = timeline.json()["audit"]
+        assert isinstance(rows, list)
+        assert any(str(row.get("trigger")) == "manual" for row in rows)
+
+    def test_harp_severity_reset_auto_compaction_triggered_by_stats(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        status_file = get_hermes_home() / "harp-routing-status.json"
+        now = time.time()
+        status_file.write_text(
+            json.dumps(
+                {
+                    "severity_reset_audit": [
+                        {
+                            "timestamp": now - 60,
+                            "allowed": True,
+                            "actor_tag": "ops-admin",
+                            "reason": "r1",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 1,
+                        },
+                        {
+                            "timestamp": now - 120,
+                            "allowed": False,
+                            "actor_tag": "ops-admin",
+                            "reason": "r2",
+                            "scope": "all",
+                            "key": "",
+                            "removed": 0,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        webhook_calls = {"count": 0}
+
+        class _DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _fake_urlopen(*args, **kwargs):
+            webhook_calls["count"] += 1
+            return _DummyResponse()
+
+        monkeypatch.setattr("hermes_cli.web_server.urllib.request.urlopen", _fake_urlopen)
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {
+                "harp_routing": {
+                    "severity_reset_auto_compact_enabled": True,
+                    "severity_reset_auto_compact_interval_seconds": 300,
+                    "severity_reset_audit_retention_days": 30,
+                    "severity_reset_admin_tags": ["ops-admin"],
+                    "severity_reset_unmute_allowed_reasons": ["manual-test"],
+                    "severity_reset_ops_signing_secret": "test-signing-secret",
+                    "severity_reset_compaction_overdue_seconds": 1,
+                    "severity_reset_compaction_max_rows": 1,
+                    "severity_reset_compaction_alert_webhook_url": "https://example.test/webhook",
+                    "severity_reset_compaction_alert_webhook_cooldown_seconds": 300,
+                    "severity_reset_compaction_webhook_audit_size": 100,
+                    "severity_reset_compaction_webhook_audit_retention_days": 30,
+                    "severity_reset_compaction_warning_severity_map": {
+                        "overdue": "warn",
+                        "rows_exceeded": "critical",
+                        "partitions_exceeded": "critical",
+                    },
+                    "severity_reset_verify_active_locks_alert_threshold": 1,
+                    "severity_reset_verify_active_locks_alerts_size": 50,
+                    "severity_reset_verify_allowed_verifiers": ["ops-audit"],
+                    "severity_reset_verify_verifier_auto_lock_enabled": True,
+                    "severity_reset_verify_verifier_auto_lock_threshold": 1,
+                    "severity_reset_verify_verifier_lock_seconds": 300,
+                    "severity_reset_verify_unlock_allowed_reasons": ["manual-test"],
+                }
+            },
+        )
+        resp = self.client.get(
+            "/api/harp-status/severity-reset-audit/stats",
+            params={"window_hours": 24, "actor_tag": "ops-admin"},
+        )
+        assert resp.status_code == 200
+        store = json.loads(status_file.read_text(encoding="utf-8"))
+        assert isinstance(store.get("severity_reset_compaction_audit"), list)
+        assert store.get("severity_reset_last_auto_compact_ts")
+        assert isinstance(store.get("severity_reset_compaction_alerts"), list)
+        assert webhook_calls["count"] >= 1
+        first_count = webhook_calls["count"]
+
+        resp2 = self.client.get(
+            "/api/harp-status/severity-reset-audit/stats",
+            params={"window_hours": 24, "actor_tag": "ops-admin"},
+        )
+        assert resp2.status_code == 200
+        assert webhook_calls["count"] == first_count
+        health = resp2.json().get("compaction_health") or {}
+        assert isinstance(health.get("warning_details"), list)
+        last_delivery = health.get("last_webhook_delivery") or {}
+        assert "attempts" in last_delivery
+        assert isinstance(health.get("webhook_slo"), dict)
+        assert isinstance(health.get("webhook_slo_windows"), dict)
+        assert isinstance(health.get("webhook_slo_anomalies"), list)
+        assert "webhook_muted_until" in health
+        assert isinstance(health.get("webhook_anomaly_state"), dict)
+        assert "unmute_count_24h" in health
+        assert "manual_unmute_rate" in health
+        assert isinstance(health.get("top_unmute_actors_24h"), list)
+
+        alerts = self.client.get(
+            "/api/harp-status/severity-reset-audit/compaction-alerts",
+            params={"limit": 1, "sort": "newest", "actor_tag": "ops-admin"},
+        )
+        assert alerts.status_code == 200
+        alerts_data = alerts.json()
+        alert_rows = alerts_data.get("alerts") or []
+        assert isinstance(alert_rows, list)
+        assert "has_more" in alerts_data
+        if alert_rows:
+            assert isinstance(alert_rows[-1].get("warning_details"), list)
+            if alerts_data.get("next_cursor_token"):
+                page2 = self.client.get(
+                    "/api/harp-status/severity-reset-audit/compaction-alerts",
+                    params={"limit": 1, "sort": "newest", "actor_tag": "ops-admin", "cursor_token": alerts_data.get("next_cursor_token")},
+                )
+                assert page2.status_code == 200
+
+        webhook_audit = self.client.get(
+            "/api/harp-status/severity-reset-audit/compaction-webhook-audit",
+            params={
+                "limit": 1,
+                "sort": "newest",
+                "actor_tag": "ops-admin",
+                "sent": "true",
+                "min_latency_ms": 0,
+                "error_contains": "",
+            },
+        )
+        assert webhook_audit.status_code == 200
+        wa_data = webhook_audit.json()
+        wa_rows = wa_data.get("audit") or []
+        assert isinstance(wa_rows, list)
+        assert "has_more" in wa_data
+
+        unmute = self.client.post(
+            "/api/harp-status/severity-reset-audit/webhook-unmute",
+            params={"actor_tag": "ops-admin", "reason": "manual-test"},
+        )
+        assert unmute.status_code == 200
+        assert unmute.json().get("ok") is True
+        denied_unmute = self.client.post(
+            "/api/harp-status/severity-reset-audit/webhook-unmute",
+            params={"actor_tag": "ops-admin", "reason": "bad-reason"},
+        )
+        assert denied_unmute.status_code == 400
+        unmute_audit = self.client.get(
+            "/api/harp-status/severity-reset-audit/unmute-audit",
+            params={
+                "actor_tag": "ops-admin",
+                "limit": 10,
+                "sort_by": "actor_tag",
+                "sort": "newest",
+                "was_muted": "true",
+                "reason_contains": "test",
+            },
+        )
+        assert unmute_audit.status_code == 200
+        ua_data = unmute_audit.json()
+        assert isinstance(ua_data.get("audit"), list)
+        assert "has_more" in ua_data
+        if ua_data.get("audit"):
+            assert "[REDACTED]" in str(ua_data["audit"][-1].get("reason", ""))
+        unmute_audit_reason = self.client.get(
+            "/api/harp-status/severity-reset-audit/unmute-audit",
+            params={"actor_tag": "ops-admin", "limit": 5, "sort_by": "reason", "sort": "newest"},
+        )
+        assert unmute_audit_reason.status_code == 200
+
+        export_json = self.client.get(
+            "/api/harp-status/severity-reset-audit/export",
+            params={"stream": "webhook", "format": "json", "limit": 5, "actor_tag": "ops-admin"},
+        )
+        assert export_json.status_code == 200
+        export_json_data = export_json.json()
+        assert export_json_data.get("stream") == "webhook"
+        assert str(export_json.headers.get("x-harp-reset-audit-page-digest", "")).startswith("sha256=")
+        verify_params = {
+            "actor_tag": "ops-admin",
+            "stream": "webhook",
+            "row_count": len(export_json_data.get("rows") or []),
+            "has_more": "true" if export_json_data.get("has_more") else "false",
+            "next_cursor_token": export_json_data.get("next_cursor_token") or "",
+            "digest": export_json.headers.get("x-harp-reset-audit-page-digest", ""),
+            "issue_receipt": "true",
+            "verifier_id": "ops-audit",
+        }
+        if export_json_data.get("next_cursor") is not None:
+            verify_params["next_cursor"] = export_json_data["next_cursor"]
+        verify_params["nonce"] = "n-123"
+        verify = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-export-page-digest",
+            params=verify_params,
+        )
+        assert verify.status_code == 200
+        assert verify.json().get("ok") is True
+        receipt = verify.json().get("receipt") or {}
+        assert receipt.get("verifier_id") == "ops-audit"
+        assert str(receipt.get("signature", "")).startswith("sha256=")
+        verify_dup = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-export-page-digest",
+            params=verify_params,
+        )
+        assert verify_dup.status_code == 200
+        assert verify_dup.json().get("ok") is False
+        assert verify_dup.json().get("duplicate_nonce") is True
+        locked = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-export-page-digest",
+            params={**verify_params, "nonce": "n-124"},
+        )
+        assert locked.status_code == 423
+        denied_verifier = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-export-page-digest",
+            params={
+                "actor_tag": "ops-admin",
+                "stream": "webhook",
+                "row_count": 1,
+                "has_more": "false",
+                "digest": "sha256=abc",
+                "verifier_id": "not-allowed",
+            },
+        )
+        assert denied_verifier.status_code == 403
+        verify_audit = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-audit",
+            params={"actor_tag": "ops-admin", "limit": 10, "sort": "newest"},
+        )
+        assert verify_audit.status_code == 200
+        verify_audit_data = verify_audit.json()
+        assert isinstance(verify_audit_data.get("audit"), list)
+        assert "has_more" in verify_audit_data
+        assert isinstance(verify_audit_data.get("nonce_duplicate_count_by_stream"), dict)
+        assert isinstance(verify_audit_data.get("active_verifier_locks"), dict)
+        assert isinstance(verify_audit_data.get("duplicate_heatmap"), dict)
+        assert isinstance(verify_audit_data.get("lock_summary"), dict)
+        assert isinstance((verify_audit_data.get("lock_summary") or {}).get("lock_entries_windows"), dict)
+        assert "active_locks_alert_dwell_seconds" in (verify_audit_data.get("lock_summary") or {})
+        assert (verify_audit_data.get("lock_summary") or {}).get("active_locks_alert_dwell_severity") in {
+            "none",
+            "warn",
+            "critical",
+        }
+        assert isinstance(verify_audit_data.get("lock_notify_metrics"), dict)
+        assert isinstance((verify_audit_data.get("lock_notify_metrics") or {}).get("windows"), dict)
+        unlock_verifier = self.client.post(
+            "/api/harp-status/severity-reset-audit/verify-verifier-unlock",
+            params={"actor_tag": "ops-admin", "verifier_id": "ops-audit", "reason": "manual-test"},
+        )
+        assert unlock_verifier.status_code == 200
+        denied_unlock = self.client.post(
+            "/api/harp-status/severity-reset-audit/verify-verifier-unlock",
+            params={"actor_tag": "ops-admin", "verifier_id": "ops-audit", "reason": "bad-reason"},
+        )
+        assert denied_unlock.status_code == 400
+        unlock_audit = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-verifier-unlock-audit",
+            params={"actor_tag": "ops-admin", "limit": 10, "sort": "newest"},
+        )
+        assert unlock_audit.status_code == 200
+        unlock_audit_data = unlock_audit.json()
+        assert isinstance(unlock_audit_data.get("audit"), list)
+        assert "has_more" in unlock_audit_data
+        lock_audit = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-lock-audit",
+            params={"actor_tag": "ops-admin", "limit": 10, "sort": "newest"},
+        )
+        assert lock_audit.status_code == 200
+        assert isinstance(lock_audit.json().get("audit"), list)
+        lock_alerts = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-lock-alerts",
+            params={"actor_tag": "ops-admin", "limit": 10, "sort": "newest"},
+        )
+        assert lock_alerts.status_code == 200
+        lock_alerts_data = lock_alerts.json()
+        assert isinstance(lock_alerts_data.get("alerts"), list)
+        assert "current_active" in lock_alerts_data
+        assert lock_alerts_data.get("threshold") == 1
+        lock_alerts_active = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-lock-alerts",
+            params={"actor_tag": "ops-admin", "limit": 10, "sort": "newest", "active": "true"},
+        )
+        assert lock_alerts_active.status_code == 200
+        assert isinstance(lock_alerts_active.json().get("alerts"), list)
+        lock_alerts_export_json = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-lock-alerts/export",
+            params={"format": "json", "limit": 10, "sort": "newest", "actor_tag": "ops-admin", "active": "true"},
+        )
+        assert lock_alerts_export_json.status_code == 200
+        assert isinstance(lock_alerts_export_json.json().get("alerts"), list)
+        assert "current_active_dwell_seconds" in lock_alerts_export_json.json()
+        assert lock_alerts_export_json.json().get("current_active_dwell_severity") in {
+            "none",
+            "warn",
+            "critical",
+        }
+        assert str(lock_alerts_export_json.headers.get("x-harp-reset-audit-page-digest", "")).startswith("sha256=")
+        lock_alerts_export_csv = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-lock-alerts/export",
+            params={"format": "csv", "limit": 10, "sort": "newest", "actor_tag": "ops-admin"},
+        )
+        assert lock_alerts_export_csv.status_code == 200
+        assert "text/csv" in str(lock_alerts_export_csv.headers.get("content-type", ""))
+        lock_bundle = self.client.get(
+            "/api/harp-status/severity-reset-audit/verify-lock-bundle/export",
+            params={"format": "json", "tail": 50, "actor_tag": "ops-admin"},
+        )
+        assert lock_bundle.status_code == 200
+        assert "lock_audit" in lock_bundle.json()
+        assert "notify_audit" in lock_bundle.json()
+        export_unlock = self.client.get(
+            "/api/harp-status/severity-reset-audit/export",
+            params={"stream": "verify_unlock", "format": "json", "limit": 5, "actor_tag": "ops-admin"},
+        )
+        assert export_unlock.status_code == 200
+        assert export_unlock.json().get("stream") == "verify_unlock"
+        export_csv = self.client.get(
+            "/api/harp-status/severity-reset-audit/export",
+            params={"stream": "alerts", "format": "csv", "limit": 5, "actor_tag": "ops-admin"},
+        )
+        assert export_csv.status_code == 200
+        assert "text/csv" in str(export_csv.headers.get("content-type", ""))
 
     # ── GET /api/media (remote image display) ───────────────────────────
 

@@ -14,10 +14,13 @@ from contextlib import asynccontextmanager, contextmanager
 import asyncio
 import base64
 import binascii
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import hmac
 import importlib.util
+import io
 import json
 import logging
 import mimetypes
@@ -173,6 +176,7 @@ def _get_event_state(app: "FastAPI"):
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+_HARP_METRICS_SEVERITY_STATE: dict[str, dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
@@ -1364,6 +1368,18 @@ async def get_status():
         # Module not importable yet (early startup) — leave as [].
         pass
 
+    harp_routing: dict[str, Any] = {}
+    try:
+        status_path = get_hermes_home() / "harp-routing-status.json"
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            harp_routing = {
+                "status": raw.get("status") if isinstance(raw.get("status"), dict) else {},
+                "history_size": len(raw.get("history") or []),
+            }
+    except Exception:
+        harp_routing = {}
+
     return {
         "version": __version__,
         "release_date": __release_date__,
@@ -1382,7 +1398,3582 @@ async def get_status():
         "active_sessions": active_sessions,
         "auth_required": auth_required,
         "auth_providers": auth_providers,
+        "harp_routing": harp_routing,
     }
+
+
+@app.get("/api/harp-status")
+async def get_harp_status(
+    tail: int = 50,
+    since: float | None = None,
+    since_id: str | None = None,
+    severity: str | None = None,
+):
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    enabled = bool(harp_cfg.get("enabled")) if isinstance(harp_cfg, dict) else False
+
+    status: dict[str, Any] = {}
+    history: list[dict[str, Any]] = []
+    alerts: list[dict[str, Any]] = []
+    try:
+        raw = json.loads((get_hermes_home() / "harp-routing-status.json").read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            if isinstance(raw.get("status"), dict):
+                status = raw.get("status") or {}
+            if isinstance(raw.get("history"), list):
+                history = [item for item in raw.get("history") if isinstance(item, dict)]
+            if isinstance(raw.get("alerts"), list):
+                alerts = [item for item in raw.get("alerts") if isinstance(item, dict)]
+    except Exception:
+        pass
+
+    if since is not None:
+        history = [item for item in history if float(item.get("timestamp") or 0.0) >= float(since)]
+        alerts = [item for item in alerts if float(item.get("timestamp") or 0.0) >= float(since)]
+
+    if since_id:
+        next_history = history
+        for idx, item in enumerate(history):
+            if str(item.get("decision_id") or "") == since_id:
+                next_history = history[idx + 1 :]
+                break
+        history = next_history
+        next_alerts = alerts
+        for idx, item in enumerate(alerts):
+            if str(item.get("audit_id") or "") == since_id:
+                next_alerts = alerts[idx + 1 :]
+                break
+        alerts = next_alerts
+
+    if severity:
+        sev = severity.strip().lower()
+        if sev and sev != "all":
+            alerts = [item for item in alerts if str(item.get("severity") or "").lower() == sev]
+
+    max_tail = 500
+    tail = max(1, min(int(tail or 50), max_tail))
+    history = history[-tail:]
+    alerts = alerts[-tail:]
+
+    provider_failure_counts: dict[str, int] = {}
+    for item in history:
+        if str(item.get("state") or "") != "failed":
+            continue
+        key = str(item.get("provider") or "unknown")
+        provider_failure_counts[key] = provider_failure_counts.get(key, 0) + 1
+
+    webhook_sent = 0
+    webhook_failed = 0
+    now_ts = time.time()
+    one_hour_ago = now_ts - 3600
+    one_day_ago = now_ts - 86400
+    w1h_sent = 0
+    w1h_failed = 0
+    w24h_sent = 0
+    w24h_failed = 0
+    for item in alerts:
+        webhook_state = str(item.get("webhook_status") or "").lower()
+        ts = float(item.get("timestamp") or 0.0)
+        if webhook_state == "sent":
+            webhook_sent += 1
+            if ts >= one_hour_ago:
+                w1h_sent += 1
+            if ts >= one_day_ago:
+                w24h_sent += 1
+        elif webhook_state == "failed":
+            webhook_failed += 1
+            if ts >= one_hour_ago:
+                w1h_failed += 1
+            if ts >= one_day_ago:
+                w24h_failed += 1
+    webhook_attempted = webhook_sent + webhook_failed
+    webhook_success_ratio = (
+        (webhook_sent / webhook_attempted) if webhook_attempted > 0 else 0.0
+    )
+    w1h_attempted = w1h_sent + w1h_failed
+    w24h_attempted = w24h_sent + w24h_failed
+
+    return {
+        "enabled": enabled,
+        "status": status,
+        "history": history,
+        "alerts": alerts,
+        "since": since,
+        "since_id": since_id,
+        "next_since_id": (
+            str((alerts[-1] if alerts else {}).get("audit_id") or "")
+            or str((history[-1] if history else {}).get("decision_id") or "")
+            or None
+        ),
+        "provider_failure_counts": provider_failure_counts,
+        "webhook_metrics": {
+            "attempted": webhook_attempted,
+            "sent": webhook_sent,
+            "failed": webhook_failed,
+            "success_ratio": webhook_success_ratio,
+            "windows": {
+                "last_1h": {
+                    "attempted": w1h_attempted,
+                    "sent": w1h_sent,
+                    "failed": w1h_failed,
+                    "success_ratio": (w1h_sent / w1h_attempted) if w1h_attempted > 0 else 0.0,
+                },
+                "last_24h": {
+                    "attempted": w24h_attempted,
+                    "sent": w24h_sent,
+                    "failed": w24h_failed,
+                    "success_ratio": (w24h_sent / w24h_attempted) if w24h_attempted > 0 else 0.0,
+                },
+            },
+        },
+    }
+
+
+@app.get("/api/harp-status/export")
+async def export_harp_status(
+    format: str = "json",
+    tail: int = 200,
+    since: float | None = None,
+    since_id: str | None = None,
+    severity: str | None = None,
+    columns: str = "full",
+):
+    payload = await get_harp_status(
+        tail=tail,
+        since=since,
+        since_id=since_id,
+        severity=severity,
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    secret = ""
+    key_id = ""
+    key_version = "v1"
+    key_deprecated = False
+    key_not_before = ""
+    key_sunset_at = ""
+    try:
+        cfg = load_config() or {}
+        harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+        if isinstance(harp_cfg, dict):
+            secret = str(
+                os.getenv("HARP_EXPORT_SIGNING_SECRET")
+                or harp_cfg.get("alert_export_signing_secret")
+                or harp_cfg.get("alert_webhook_secret")
+                or ""
+            )
+            key_id = str(harp_cfg.get("alert_export_signing_key_id") or "")
+            key_version = str(harp_cfg.get("alert_export_signing_key_version") or "v1")
+            key_deprecated = bool(harp_cfg.get("alert_export_signing_key_deprecated") or False)
+            key_not_before = str(harp_cfg.get("alert_export_signing_not_before") or "")
+            key_sunset_at = str(harp_cfg.get("alert_export_signing_sunset_at") or "")
+    except Exception:
+        secret = ""
+        key_id = ""
+        key_version = "v1"
+        key_deprecated = False
+        key_not_before = ""
+        key_sunset_at = ""
+    if key_not_before and key_sunset_at:
+        try:
+            nb = datetime.fromisoformat(key_not_before.replace("Z", "+00:00"))
+            sa = datetime.fromisoformat(key_sunset_at.replace("Z", "+00:00"))
+            if sa < nb:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid key timeline: alert_export_signing_sunset_at is earlier than alert_export_signing_not_before",
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid key timeline format: {exc}")
+    if str(format).lower() == "csv":
+        minimal_columns = str(columns).lower() == "minimal"
+
+        def _esc(value: Any) -> str:
+            return '"' + str(value or "").replace('"', '""') + '"'
+
+        if minimal_columns:
+            rows = ["type,timestamp,state_or_severity,message"]
+        else:
+            rows = [
+                "type,timestamp,state_or_severity,provider,model,audit_id,webhook_status,message",
+            ]
+        for row in payload.get("history", []):
+            if minimal_columns:
+                rows.append(
+                    ",".join(
+                        [
+                            _esc("decision"),
+                            _esc(row.get("timestamp")),
+                            _esc(row.get("state")),
+                            _esc(row.get("reason")),
+                        ]
+                    )
+                )
+            else:
+                rows.append(
+                    ",".join(
+                        [
+                            _esc("decision"),
+                            _esc(row.get("timestamp")),
+                            _esc(row.get("state")),
+                            _esc(row.get("provider")),
+                            _esc(row.get("model")),
+                            _esc(""),
+                            _esc(""),
+                            _esc(row.get("reason")),
+                        ]
+                    )
+                )
+        for row in payload.get("alerts", []):
+            if minimal_columns:
+                rows.append(
+                    ",".join(
+                        [
+                            _esc("alert"),
+                            _esc(row.get("timestamp")),
+                            _esc(row.get("severity")),
+                            _esc(row.get("message")),
+                        ]
+                    )
+                )
+            else:
+                rows.append(
+                    ",".join(
+                        [
+                            _esc("alert"),
+                            _esc(row.get("timestamp")),
+                            _esc(row.get("severity")),
+                            _esc(""),
+                            _esc(""),
+                            _esc(row.get("audit_id")),
+                            _esc(row.get("webhook_status")),
+                            _esc(row.get("message")),
+                        ]
+                    )
+                )
+        content = "\n".join(rows)
+        checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        manifest = f"{generated_at}:{checksum}"
+        headers = {
+            "Content-Disposition": f'attachment; filename="harp-status-{stamp}.csv"',
+            "X-HARP-Export-Generated-At": generated_at,
+            "X-HARP-Export-Checksum-SHA256": checksum,
+        }
+        if secret:
+            resolved_key_id = key_id or hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+            sig = hmac.new(
+                secret.encode("utf-8"),
+                manifest.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-HARP-Export-Signature"] = f"sha256={sig}"
+            headers["X-HARP-Export-Key-Id"] = resolved_key_id
+            headers["X-HARP-Export-Key-Alg"] = "hmac-sha256"
+            headers["X-HARP-Export-Key-Version"] = key_version
+            headers["X-HARP-Export-Key-Deprecated"] = "true" if key_deprecated else "false"
+            if key_not_before:
+                headers["X-HARP-Export-Key-Not-Before"] = key_not_before
+            if key_sunset_at:
+                headers["X-HARP-Export-Key-Sunset-At"] = key_sunset_at
+        return Response(content=content, media_type="text/csv", headers=headers)
+    content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    manifest = f"{generated_at}:{checksum}"
+    headers = {
+        "Content-Disposition": f'attachment; filename="harp-status-{stamp}.json"',
+        "X-HARP-Export-Generated-At": generated_at,
+        "X-HARP-Export-Checksum-SHA256": checksum,
+    }
+    if secret:
+        resolved_key_id = key_id or hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+        sig = hmac.new(
+            secret.encode("utf-8"),
+            manifest.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        headers["X-HARP-Export-Signature"] = f"sha256={sig}"
+        headers["X-HARP-Export-Key-Id"] = resolved_key_id
+        headers["X-HARP-Export-Key-Alg"] = "hmac-sha256"
+        headers["X-HARP-Export-Key-Version"] = key_version
+        headers["X-HARP-Export-Key-Deprecated"] = "true" if key_deprecated else "false"
+        if key_not_before:
+            headers["X-HARP-Export-Key-Not-Before"] = key_not_before
+        if key_sunset_at:
+            headers["X-HARP-Export-Key-Sunset-At"] = key_sunset_at
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers=headers,
+    )
+
+
+@app.get("/api/harp-status/metrics")
+async def get_harp_status_metrics(
+    window_hours: int = 24,
+    bucket: str = "1h",
+    failed_delta_warning_threshold: int = 0,
+    failed_delta_info_threshold: int = 0,
+    failed_delta_warn_threshold: int = 0,
+    failed_delta_critical_threshold: int = 0,
+    severity_cooldown_seconds: int = 0,
+    severity_state_key: str = "default",
+):
+    if window_hours < 1:
+        window_hours = 1
+    if window_hours > 168:
+        window_hours = 168
+    bucket_label = str(bucket or "1h").strip().lower()
+    bucket_seconds = 3600
+    if bucket_label == "1m":
+        bucket_seconds = 60
+    elif bucket_label == "5m":
+        bucket_seconds = 300
+    elif bucket_label == "1h":
+        bucket_seconds = 3600
+    else:
+        bucket_label = "1h"
+        bucket_seconds = 3600
+    now_ts = time.time()
+    window_start = now_ts - (window_hours * 3600)
+    try:
+        cfg = load_config() or {}
+        harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        harp_cfg = {}
+    max_age_seconds = 86400
+    max_keys = 200
+    if isinstance(harp_cfg, dict):
+        try:
+            max_age_seconds = int(harp_cfg.get("severity_state_max_age_seconds") or 86400)
+        except Exception:
+            max_age_seconds = 86400
+        try:
+            max_keys = int(harp_cfg.get("severity_state_max_keys") or 200)
+        except Exception:
+            max_keys = 200
+    if max_age_seconds > 0:
+        cutoff = now_ts - max_age_seconds
+        for key in list(_HARP_METRICS_SEVERITY_STATE.keys()):
+            state = _HARP_METRICS_SEVERITY_STATE.get(key) or {}
+            if float(state.get("since_ts") or 0.0) < cutoff:
+                _HARP_METRICS_SEVERITY_STATE.pop(key, None)
+    if max_keys > 0 and len(_HARP_METRICS_SEVERITY_STATE) > max_keys:
+        ordered = sorted(
+            _HARP_METRICS_SEVERITY_STATE.items(),
+            key=lambda kv: float((kv[1] or {}).get("since_ts") or 0.0),
+            reverse=True,
+        )
+        keep = {k for k, _ in ordered[:max_keys]}
+        for key in list(_HARP_METRICS_SEVERITY_STATE.keys()):
+            if key not in keep:
+                _HARP_METRICS_SEVERITY_STATE.pop(key, None)
+
+    alerts: list[dict[str, Any]] = []
+    try:
+        raw = json.loads((get_hermes_home() / "harp-routing-status.json").read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("alerts"), list):
+            alerts = [item for item in raw.get("alerts") if isinstance(item, dict)]
+    except Exception:
+        alerts = []
+
+    start_bucket = int(window_start // bucket_seconds) * bucket_seconds
+    end_bucket = int(now_ts // bucket_seconds) * bucket_seconds
+    buckets: dict[int, dict[str, Any]] = {}
+    ts = start_bucket
+    while ts <= end_bucket:
+        buckets[ts] = {
+            "bucket_start": ts,
+            "attempted": 0,
+            "sent": 0,
+            "failed": 0,
+            "success_ratio": 0.0,
+        }
+        ts += bucket_seconds
+
+    for alert in alerts:
+        status = str(alert.get("webhook_status") or "").lower()
+        if status not in {"sent", "failed"}:
+            continue
+        ats = float(alert.get("timestamp") or 0.0)
+        if ats < window_start:
+            continue
+        bucket_ts = int(ats // bucket_seconds) * bucket_seconds
+        if bucket_ts not in buckets:
+            continue
+        buckets[bucket_ts]["attempted"] += 1
+        if status == "sent":
+            buckets[bucket_ts]["sent"] += 1
+        else:
+            buckets[bucket_ts]["failed"] += 1
+
+    def _percentile(values: list[int], p: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = int(round((len(ordered) - 1) * p))
+        index = min(max(index, 0), len(ordered) - 1)
+        return float(ordered[index])
+
+    def _failure_streak_summary(start_ts: float) -> dict[str, Any]:
+        streaks: list[int] = []
+        current_streak = 0
+        ordered_alerts = sorted(
+            [
+                item
+                for item in alerts
+                if float(item.get("timestamp") or 0.0) >= start_ts
+                and str(item.get("webhook_status") or "").lower() in {"sent", "failed"}
+            ],
+            key=lambda item: float(item.get("timestamp") or 0.0),
+        )
+        for item in ordered_alerts:
+            state = str(item.get("webhook_status") or "").lower()
+            if state == "failed":
+                current_streak += 1
+            elif state == "sent":
+                if current_streak > 0:
+                    streaks.append(current_streak)
+                    current_streak = 0
+        if current_streak > 0:
+            streaks.append(current_streak)
+        return {
+            "count": len(streaks),
+            "max": max(streaks) if streaks else 0,
+            "p95": _percentile(streaks, 0.95),
+        }
+
+    def _status_counts(start_ts: float, end_ts: float) -> dict[str, int]:
+        sent = 0
+        failed = 0
+        for item in alerts:
+            ts = float(item.get("timestamp") or 0.0)
+            if ts < start_ts or ts >= end_ts:
+                continue
+            state = str(item.get("webhook_status") or "").lower()
+            if state == "sent":
+                sent += 1
+            elif state == "failed":
+                failed += 1
+        return {"sent": sent, "failed": failed, "attempted": sent + failed}
+
+    series: list[dict[str, Any]] = []
+    for bucket in sorted(buckets):
+        row = buckets[bucket]
+        attempted = int(row["attempted"])
+        sent = int(row["sent"])
+        row["success_ratio"] = (sent / attempted) if attempted > 0 else 0.0
+        series.append(row)
+
+    recent = _status_counts(now_ts - 3600, now_ts)
+    prev = _status_counts(now_ts - 7200, now_ts - 3600)
+    sent_delta = recent["sent"] - prev["sent"]
+    failed_delta = recent["failed"] - prev["failed"]
+    attempted_delta = recent["attempted"] - prev["attempted"]
+    warn_threshold = (
+        failed_delta_warn_threshold
+        if failed_delta_warn_threshold > 0
+        else failed_delta_warning_threshold
+    )
+    raw_severity = "none"
+    if failed_delta_critical_threshold > 0 and failed_delta >= failed_delta_critical_threshold:
+        raw_severity = "critical"
+    elif warn_threshold > 0 and failed_delta >= warn_threshold:
+        raw_severity = "warn"
+    elif failed_delta_info_threshold > 0 and failed_delta >= failed_delta_info_threshold:
+        raw_severity = "info"
+
+    severity = raw_severity
+    state_key = str(severity_state_key or "default")
+    breach_counters = {"info": 0, "warn": 0, "critical": 0}
+    last_breach_ts = {"info": 0.0, "warn": 0.0, "critical": 0.0}
+    if severity_cooldown_seconds > 0:
+        levels = {"none": 0, "info": 1, "warn": 2, "critical": 3}
+        state = _HARP_METRICS_SEVERITY_STATE.get(state_key, {})
+        prev_severity = str(state.get("severity") or "none")
+        prev_since = float(state.get("since_ts") or 0.0)
+        breach_counters = dict(state.get("breach_counters") or breach_counters)
+        last_breach_ts = dict(state.get("last_breach_ts") or last_breach_ts)
+        if levels.get(prev_severity, 0) > levels.get(raw_severity, 0):
+            if now_ts - prev_since < severity_cooldown_seconds:
+                severity = prev_severity
+            else:
+                severity = raw_severity
+                _HARP_METRICS_SEVERITY_STATE[state_key] = {
+                    "severity": raw_severity,
+                    "since_ts": now_ts,
+                    "breach_counters": breach_counters,
+                    "last_breach_ts": last_breach_ts,
+                }
+        elif prev_severity != raw_severity:
+            _HARP_METRICS_SEVERITY_STATE[state_key] = {
+                "severity": raw_severity,
+                "since_ts": now_ts,
+                "breach_counters": breach_counters,
+                "last_breach_ts": last_breach_ts,
+            }
+    else:
+        state = _HARP_METRICS_SEVERITY_STATE.get(state_key, {})
+        breach_counters = dict(state.get("breach_counters") or breach_counters)
+        last_breach_ts = dict(state.get("last_breach_ts") or last_breach_ts)
+        _HARP_METRICS_SEVERITY_STATE[state_key] = {
+            "severity": raw_severity,
+            "since_ts": now_ts,
+            "breach_counters": breach_counters,
+            "last_breach_ts": last_breach_ts,
+        }
+
+    if failed_delta_info_threshold > 0 and failed_delta >= failed_delta_info_threshold:
+        breach_counters["info"] = int(breach_counters.get("info", 0)) + 1
+        last_breach_ts["info"] = now_ts
+    if warn_threshold > 0 and failed_delta >= warn_threshold:
+        breach_counters["warn"] = int(breach_counters.get("warn", 0)) + 1
+        last_breach_ts["warn"] = now_ts
+    if failed_delta_critical_threshold > 0 and failed_delta >= failed_delta_critical_threshold:
+        breach_counters["critical"] = int(breach_counters.get("critical", 0)) + 1
+        last_breach_ts["critical"] = now_ts
+    _HARP_METRICS_SEVERITY_STATE[state_key] = {
+        **(_HARP_METRICS_SEVERITY_STATE.get(state_key) or {}),
+        "breach_counters": breach_counters,
+        "last_breach_ts": last_breach_ts,
+    }
+
+    return {
+        "window_hours": window_hours,
+        "bucket": bucket_label,
+        "bucket_seconds": bucket_seconds,
+        "series": series,
+        "reliability": {
+            "failure_streak": _failure_streak_summary(window_start),
+            "windows": {
+                "last_1h": _failure_streak_summary(now_ts - 3600),
+                "last_24h": _failure_streak_summary(now_ts - 86400),
+            },
+            "deltas": {
+                "last_1h_vs_prev_1h": {
+                    "sent_delta": sent_delta,
+                    "failed_delta": failed_delta,
+                    "attempted_delta": attempted_delta,
+                    "warning_threshold": failed_delta_warning_threshold,
+                    "warning": (
+                        failed_delta_warning_threshold > 0
+                        and failed_delta >= failed_delta_warning_threshold
+                    ),
+                    "severity_thresholds": {
+                        "info": failed_delta_info_threshold,
+                        "warn": warn_threshold,
+                        "critical": failed_delta_critical_threshold,
+                    },
+                    "severity": severity,
+                    "severity_raw": raw_severity,
+                    "severity_cooldown_seconds": severity_cooldown_seconds,
+                    "severity_state_key": state_key,
+                    "breach_counters": breach_counters,
+                    "last_breach_ts": last_breach_ts,
+                }
+            },
+        },
+    }
+
+
+@app.get("/api/harp-status/lint")
+async def lint_harp_status_config(strict: bool = False):
+    issues: list[str] = []
+    warnings: list[str] = []
+    reason_codes: list[str] = []
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+
+    not_before = str(harp_cfg.get("alert_export_signing_not_before") or "").strip()
+    sunset_at = str(harp_cfg.get("alert_export_signing_sunset_at") or "").strip()
+    key_version = str(harp_cfg.get("alert_export_signing_key_version") or "").strip()
+    deprecated = bool(harp_cfg.get("alert_export_signing_key_deprecated") or False)
+
+    parsed_nb = None
+    parsed_sa = None
+    if not_before:
+        try:
+            parsed_nb = datetime.fromisoformat(not_before.replace("Z", "+00:00"))
+        except Exception as exc:
+            issues.append(f"Invalid alert_export_signing_not_before format: {exc}")
+            reason_codes.append("invalid_not_before_format")
+    if sunset_at:
+        try:
+            parsed_sa = datetime.fromisoformat(sunset_at.replace("Z", "+00:00"))
+        except Exception as exc:
+            issues.append(f"Invalid alert_export_signing_sunset_at format: {exc}")
+            reason_codes.append("invalid_sunset_format")
+    if parsed_nb and parsed_sa and parsed_sa < parsed_nb:
+        issues.append("Invalid key timeline: sunset_at is earlier than not_before")
+        reason_codes.append("invalid_timeline_order")
+    if deprecated and not sunset_at:
+        warnings.append("Key is marked deprecated but alert_export_signing_sunset_at is not set")
+        reason_codes.append("deprecated_without_sunset")
+    if not key_version:
+        warnings.append("alert_export_signing_key_version is empty")
+        reason_codes.append("empty_key_version")
+
+    escalated_warnings: list[str] = []
+    if strict and warnings:
+        escalated_warnings = list(warnings)
+        issues.extend(f"[strict] {w}" for w in warnings)
+        reason_codes.append("strict_warning_escalated")
+
+    # Persist compact lint history for regression visibility.
+    lint_size = int(harp_cfg.get("lint_history_size") or 100) if isinstance(harp_cfg, dict) else 100
+    if lint_size < 1:
+        lint_size = 1
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    lint_entry = {
+        "timestamp": time.time(),
+        "ok": len(issues) == 0,
+        "strict": bool(strict),
+        "issues_count": len(issues),
+        "warnings_count": len(warnings),
+        "reason_codes": sorted(set(reason_codes)),
+    }
+    try:
+        store = {}
+        if status_path.exists():
+            raw = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                store = raw
+        history = list(store.get("lint_history") or [])
+        history.append(lint_entry)
+        if len(history) > lint_size:
+            history = history[-lint_size:]
+        store["lint_history"] = history
+        status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "ok": len(issues) == 0,
+        "strict": bool(strict),
+        "escalated_warnings": len(escalated_warnings),
+        "issues": issues,
+        "warnings": warnings,
+        "reason_codes": sorted(set(reason_codes)),
+    }
+
+
+@app.get("/api/harp-status/lint-history")
+async def get_harp_status_lint_history(tail: int = 20):
+    if tail < 1:
+        tail = 1
+    if tail > 500:
+        tail = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    history: list[dict[str, Any]] = []
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("lint_history"), list):
+            history = [item for item in raw["lint_history"] if isinstance(item, dict)]
+    except Exception:
+        history = []
+    return {"history": history[-tail:]}
+
+
+def _severity_reset_audit_day(ts: float) -> str:
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _read_severity_reset_audit(store: dict[str, Any]) -> list[dict[str, Any]]:
+    partitions = store.get("severity_reset_audit_partitions")
+    if isinstance(partitions, dict) and partitions:
+        rows: list[dict[str, Any]] = []
+        for day in sorted(partitions.keys()):
+            bucket = partitions.get(day)
+            if not isinstance(bucket, list):
+                continue
+            rows.extend(item for item in bucket if isinstance(item, dict))
+        if rows:
+            return rows
+    flat = store.get("severity_reset_audit")
+    if isinstance(flat, list):
+        return [item for item in flat if isinstance(item, dict)]
+    return []
+
+
+def _write_severity_reset_audit(
+    store: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    audit_size: int,
+    retention_days: int,
+) -> None:
+    audit = _read_severity_reset_audit(store)
+    audit.append(row)
+    cutoff = None
+    if retention_days > 0:
+        cutoff = time.time() - (retention_days * 86400)
+    if cutoff is not None:
+        audit = [item for item in audit if float(item.get("timestamp") or 0.0) >= cutoff]
+    if len(audit) > audit_size:
+        audit = audit[-audit_size:]
+    partitions: dict[str, list[dict[str, Any]]] = {}
+    for item in audit:
+        day = _severity_reset_audit_day(float(item.get("timestamp") or 0.0))
+        partitions.setdefault(day, []).append(item)
+    store["severity_reset_audit"] = audit
+    store["severity_reset_audit_partitions"] = partitions
+
+
+def _normalize_severity_reset_audit_row(item: dict[str, Any], idx: int) -> dict[str, Any]:
+    row = dict(item)
+    audit_id = str(row.get("audit_id") or "").strip()
+    if not audit_id:
+        audit_id = f"legacy-{idx:08d}"
+    row["audit_id"] = audit_id
+    row["timestamp"] = float(row.get("timestamp") or 0.0)
+    return row
+
+
+def _cursor_sign(timestamp: float, audit_id: str, secret: str) -> str:
+    msg = f"{timestamp:.6f}|{audit_id}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _normalize_actor_tag(value: str | None) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def _normalize_actor_tag_with_cfg(value: str | None, harp_cfg: dict[str, Any]) -> str:
+    normalized = _normalize_actor_tag(value)
+    alias_map = harp_cfg.get("severity_reset_actor_normalization_regex_map")
+    if not isinstance(alias_map, dict) or not alias_map:
+        return normalized
+    for pattern, alias in alias_map.items():
+        try:
+            if re.search(str(pattern), normalized, flags=re.IGNORECASE):
+                candidate = _normalize_actor_tag(str(alias))
+                if candidate:
+                    return candidate
+        except re.error:
+            continue
+    return normalized
+
+
+def _normalize_verifier_id_with_cfg(value: str | None, harp_cfg: dict[str, Any]) -> str:
+    normalized = _normalize_actor_tag(value)
+    alias_map = harp_cfg.get("severity_reset_verifier_normalization_regex_map")
+    if not isinstance(alias_map, dict) or not alias_map:
+        return normalized
+    for pattern, alias in alias_map.items():
+        try:
+            if re.search(str(pattern), normalized, flags=re.IGNORECASE):
+                candidate = _normalize_actor_tag(str(alias))
+                if candidate:
+                    return candidate
+        except re.error:
+            continue
+    return normalized
+
+
+def _severity_reset_actor_allowed(harp_cfg: dict[str, Any], actor_tag: str | None) -> bool:
+    allowed_tags = {
+        _normalize_actor_tag(str(x))
+        for x in (harp_cfg.get("severity_reset_admin_tags") or [])
+        if str(x).strip()
+    }
+    if not allowed_tags:
+        return True
+    return _normalize_actor_tag(actor_tag) in allowed_tags
+
+
+def _compact_severity_reset_rows(
+    rows: list[dict[str, Any]],
+    *,
+    audit_size: int,
+    retention_days: int,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    normalized = [_normalize_severity_reset_audit_row(item, idx) for idx, item in enumerate(rows)]
+    cutoff = None
+    if retention_days > 0:
+        cutoff = time.time() - (retention_days * 86400)
+    if cutoff is not None:
+        normalized = [row for row in normalized if float(row.get("timestamp") or 0.0) >= cutoff]
+    if len(normalized) > audit_size:
+        normalized = normalized[-audit_size:]
+    partitions: dict[str, list[dict[str, Any]]] = {}
+    for row in normalized:
+        day = _severity_reset_audit_day(float(row.get("timestamp") or 0.0))
+        partitions.setdefault(day, []).append(row)
+    return normalized, partitions
+
+
+def _append_severity_reset_compaction_audit(
+    store: dict[str, Any],
+    *,
+    trigger: str,
+    actor_tag: str,
+    before: int,
+    after: int,
+    partitions: int,
+    max_size: int,
+) -> None:
+    events = list(store.get("severity_reset_compaction_audit") or [])
+    events.append(
+        {
+            "cursor_id": f"sca-{secrets.token_hex(6)}",
+            "timestamp": time.time(),
+            "trigger": trigger,
+            "actor_tag": actor_tag,
+            "before": before,
+            "after": after,
+            "partitions": partitions,
+        }
+    )
+    if max_size < 1:
+        max_size = 1
+    if len(events) > max_size:
+        events = events[-max_size:]
+    store["severity_reset_compaction_audit"] = events
+
+
+def _maybe_auto_compact_severity_reset_audit(store: dict[str, Any], harp_cfg: dict[str, Any]) -> bool:
+    if not bool(harp_cfg.get("severity_reset_auto_compact_enabled")):
+        return False
+    interval = int(harp_cfg.get("severity_reset_auto_compact_interval_seconds") or 86400)
+    if interval < 300:
+        interval = 300
+    now_ts = time.time()
+    last_run = float(store.get("severity_reset_last_auto_compact_ts") or 0.0)
+    if (now_ts - last_run) < interval:
+        return False
+    audit_size = int(harp_cfg.get("severity_reset_audit_size") or 200)
+    if audit_size < 1:
+        audit_size = 1
+    retention_days = int(harp_cfg.get("severity_reset_audit_retention_days") or 30)
+    if retention_days < 0:
+        retention_days = 0
+    before_rows = _read_severity_reset_audit(store)
+    compact_rows, partitions = _compact_severity_reset_rows(
+        before_rows,
+        audit_size=audit_size,
+        retention_days=retention_days,
+    )
+    store["severity_reset_audit"] = compact_rows
+    store["severity_reset_audit_partitions"] = partitions
+    store["severity_reset_last_auto_compact_ts"] = now_ts
+    _append_severity_reset_compaction_audit(
+        store,
+        trigger="auto",
+        actor_tag=str(harp_cfg.get("severity_reset_auto_compact_actor_tag") or "system-auto-compact"),
+        before=len(before_rows),
+        after=len(compact_rows),
+        partitions=len(partitions),
+        max_size=int(harp_cfg.get("severity_reset_compaction_audit_size") or 100),
+    )
+    return True
+
+
+def _evaluate_severity_reset_compaction_drift(
+    store: dict[str, Any],
+    harp_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    now_ts = time.time()
+    muted_before = float(store.get("severity_reset_compaction_webhook_muted_until") or 0.0) > now_ts
+    last_compact_ts = float(store.get("severity_reset_last_auto_compact_ts") or 0.0)
+    rows = _read_severity_reset_audit(store)
+    partitions = store.get("severity_reset_audit_partitions")
+    partition_count = len(partitions) if isinstance(partitions, dict) else 0
+
+    overdue_threshold = int(harp_cfg.get("severity_reset_compaction_overdue_seconds") or 0)
+    max_partitions = int(harp_cfg.get("severity_reset_compaction_max_partitions") or 0)
+    max_rows = int(harp_cfg.get("severity_reset_compaction_max_rows") or 0)
+
+    if overdue_threshold > 0 and (last_compact_ts <= 0 or (now_ts - last_compact_ts) > overdue_threshold):
+        warnings.append("overdue")
+    if max_partitions > 0 and partition_count > max_partitions:
+        warnings.append("partitions_exceeded")
+    if max_rows > 0 and len(rows) > max_rows:
+        warnings.append("rows_exceeded")
+
+    prev = set(str(x) for x in (store.get("severity_reset_last_compaction_alert_codes") or []))
+    cur = set(warnings)
+    configured_map = harp_cfg.get("severity_reset_compaction_warning_severity_map")
+    warning_severity = (
+        configured_map if isinstance(configured_map, dict) else {
+            "overdue": "warn",
+            "partitions_exceeded": "critical",
+            "rows_exceeded": "critical",
+        }
+    )
+    warning_details = [
+        {
+            "code": code,
+            "severity": (
+                str(warning_severity.get(code, "info")).strip().lower()
+                if str(warning_severity.get(code, "info")).strip().lower() in {"info", "warn", "critical"}
+                else "info"
+            ),
+        }
+        for code in sorted(cur)
+    ]
+
+    if cur != prev:
+        alerts = list(store.get("severity_reset_compaction_alerts") or [])
+        high_severity = bool(cur.intersection({"partitions_exceeded", "rows_exceeded"}))
+        event = {
+            "cursor_id": f"scl-{secrets.token_hex(6)}",
+            "timestamp": now_ts,
+            "warnings": sorted(cur),
+            "warning_details": warning_details,
+            "rows": len(rows),
+            "partitions": partition_count,
+            "last_compact_ts": last_compact_ts,
+            "high_severity": high_severity,
+            "previous_warnings": sorted(prev),
+        }
+        alerts.append(
+            event
+        )
+        alerts_size = int(harp_cfg.get("severity_reset_compaction_alerts_size") or 100)
+        if alerts_size < 1:
+            alerts_size = 1
+        alerts_retention_days = int(harp_cfg.get("severity_reset_compaction_alerts_retention_days") or 30)
+        if alerts_retention_days < 0:
+            alerts_retention_days = 0
+        if alerts_retention_days > 0:
+            cutoff = now_ts - (alerts_retention_days * 86400)
+            alerts = [row for row in alerts if float(row.get("timestamp") or 0.0) >= cutoff]
+        if len(alerts) > alerts_size:
+            alerts = alerts[-alerts_size:]
+        store["severity_reset_compaction_alerts"] = alerts
+        store["severity_reset_last_compaction_alert_codes"] = sorted(cur)
+        if high_severity:
+            cooldown_seconds = int(harp_cfg.get("severity_reset_compaction_alert_webhook_cooldown_seconds") or 300)
+            if cooldown_seconds < 0:
+                cooldown_seconds = 0
+            state_key = ",".join(sorted(cur))
+            last_state = str(store.get("severity_reset_last_webhook_state") or "")
+            last_sent = float(store.get("severity_reset_last_webhook_sent_ts") or 0.0)
+            can_send = (
+                state_key != last_state
+                or cooldown_seconds == 0
+                or (now_ts - last_sent) >= cooldown_seconds
+            )
+            muted_until = float(store.get("severity_reset_compaction_webhook_muted_until") or 0.0)
+            muted_now = muted_until > now_ts
+            sent = False
+            delivery: dict[str, Any] = {}
+            if can_send and not muted_now:
+                delivery = _send_compaction_alert_webhook(event, harp_cfg)
+                sent = bool(delivery.get("sent"))
+                if sent:
+                    store["severity_reset_last_webhook_state"] = state_key
+                    store["severity_reset_last_webhook_sent_ts"] = now_ts
+                webhook_audit = list(store.get("severity_reset_compaction_webhook_audit") or [])
+                webhook_audit.append(
+                    {
+                        "cursor_id": f"scw-{secrets.token_hex(6)}",
+                        "timestamp": now_ts,
+                        "warnings": sorted(cur),
+                        "attempts": int(delivery.get("attempts") or 0),
+                        "sent": bool(delivery.get("sent")),
+                        "last_error": str(delivery.get("last_error") or ""),
+                        "latency_ms": (
+                            int(delivery.get("latency_ms"))
+                            if delivery.get("latency_ms") is not None
+                            else None
+                        ),
+                    }
+                )
+                audit_size = int(harp_cfg.get("severity_reset_compaction_webhook_audit_size") or 100)
+                if audit_size < 1:
+                    audit_size = 1
+                webhook_retention_days = int(harp_cfg.get("severity_reset_compaction_webhook_audit_retention_days") or 30)
+                if webhook_retention_days < 0:
+                    webhook_retention_days = 0
+                if webhook_retention_days > 0:
+                    webhook_cutoff = now_ts - (webhook_retention_days * 86400)
+                    webhook_audit = [
+                        row for row in webhook_audit if float(row.get("timestamp") or 0.0) >= webhook_cutoff
+                    ]
+                if len(webhook_audit) > audit_size:
+                    webhook_audit = webhook_audit[-audit_size:]
+                store["severity_reset_compaction_webhook_audit"] = webhook_audit
+            store["severity_reset_last_webhook_delivery"] = {
+                "timestamp": now_ts,
+                "sent": sent if can_send and not muted_now else False,
+                "skipped_cooldown": (not can_send),
+                "skipped_backoff": (can_send and muted_now),
+                "warnings": sorted(cur),
+                "attempts": int(delivery.get("attempts") or 0) if can_send else 0,
+                "last_error": str(delivery.get("last_error") or "") if can_send else "",
+                "latency_ms": (
+                    int(delivery.get("latency_ms"))
+                    if can_send and delivery.get("latency_ms") is not None
+                    else None
+                ),
+            }
+
+    webhook_audit_rows = [item for item in (store.get("severity_reset_compaction_webhook_audit") or []) if isinstance(item, dict)]
+    def _compute_slo(rows_for_slo: list[dict[str, Any]]) -> dict[str, Any]:
+        attempts = len(rows_for_slo)
+        sent_count = sum(1 for row in rows_for_slo if bool(row.get("sent")))
+        fail_count = attempts - sent_count
+        latencies = sorted(
+            int(row.get("latency_ms"))
+            for row in rows_for_slo
+            if row.get("latency_ms") is not None
+        )
+        p95_latency_ms = None
+        if latencies:
+            idx = max(0, min(len(latencies) - 1, int(round(0.95 * (len(latencies) - 1)))))
+            p95_latency_ms = latencies[idx]
+        failure_streak = 0
+        for row in reversed(rows_for_slo):
+            if bool(row.get("sent")):
+                break
+            failure_streak += 1
+        return {
+            "attempted": attempts,
+            "sent": sent_count,
+            "failed": fail_count,
+            "success_rate": (sent_count / attempts) if attempts > 0 else 0.0,
+            "p95_latency_ms": p95_latency_ms,
+            "failure_streak": failure_streak,
+        }
+
+    one_hour_ago = now_ts - 3600
+    one_day_ago = now_ts - 86400
+    slo_all = _compute_slo(webhook_audit_rows)
+    slo_1h = _compute_slo([row for row in webhook_audit_rows if float(row.get("timestamp") or 0.0) >= one_hour_ago])
+    slo_24h = _compute_slo([row for row in webhook_audit_rows if float(row.get("timestamp") or 0.0) >= one_day_ago])
+    unmute_rows = [item for item in (store.get("severity_reset_compaction_unmute_audit") or []) if isinstance(item, dict)]
+    unmute_count_24h = sum(1 for row in unmute_rows if float(row.get("timestamp") or 0.0) >= one_day_ago)
+    unmute_actor_counts: dict[str, int] = {}
+    for row in unmute_rows:
+        if float(row.get("timestamp") or 0.0) < one_day_ago:
+            continue
+        key = _normalize_actor_tag_with_cfg(str(row.get("actor_tag") or "unknown"), harp_cfg) or "unknown"
+        unmute_actor_counts[key] = unmute_actor_counts.get(key, 0) + 1
+    top_n_unmute = int(harp_cfg.get("severity_reset_top_unmute_actors_limit") or 5)
+    if top_n_unmute < 1:
+        top_n_unmute = 1
+    if top_n_unmute > 100:
+        top_n_unmute = 100
+    top_unmute_actors_24h = [
+        {"actor_tag": k, "count": v}
+        for k, v in sorted(unmute_actor_counts.items(), key=lambda item: item[1], reverse=True)[:top_n_unmute]
+    ]
+    manual_unmute_rate = (
+        (unmute_count_24h / float(slo_24h.get("attempted") or 1))
+        if int(slo_24h.get("attempted") or 0) > 0
+        else 0.0
+    )
+    anomalies: list[str] = []
+    p95_1h = slo_1h.get("p95_latency_ms")
+    p95_24h = slo_24h.get("p95_latency_ms")
+    p95_multiplier = float(harp_cfg.get("severity_reset_compaction_anomaly_p95_multiplier") or 1.5)
+    min_attempts = int(harp_cfg.get("severity_reset_compaction_anomaly_min_attempts") or 5)
+    success_drop_delta = float(harp_cfg.get("severity_reset_compaction_anomaly_success_drop_delta") or 0.2)
+    fast_fail_min_failed = int(harp_cfg.get("severity_reset_compaction_anomaly_fast_fail_min_failed") or 3)
+    fast_fail_max_success_rate = float(
+        harp_cfg.get("severity_reset_compaction_anomaly_fast_fail_max_success_rate") or 0.5
+    )
+    if (
+        p95_1h is not None
+        and p95_24h is not None
+        and int(slo_1h.get("attempted") or 0) >= min_attempts
+        and float(p95_1h) > (float(p95_24h) * p95_multiplier)
+    ):
+        anomalies.append("p95_latency_spike")
+    if (
+        int(slo_1h.get("attempted") or 0) >= min_attempts
+        and float(slo_1h.get("success_rate") or 0.0) < fast_fail_max_success_rate
+        and int(slo_1h.get("failed") or 0) >= fast_fail_min_failed
+    ):
+        anomalies.append("fast_fail_burst")
+    if (
+        int(slo_1h.get("attempted") or 0) >= min_attempts
+        and int(slo_24h.get("attempted") or 0) >= min_attempts
+        and float(slo_1h.get("success_rate") or 0.0) + success_drop_delta < float(slo_24h.get("success_rate") or 0.0)
+    ):
+        anomalies.append("success_rate_drop")
+
+    if "fast_fail_burst" in anomalies:
+        events = [float(x) for x in (store.get("severity_reset_compaction_fast_fail_events") or [])]
+        window_seconds = int(harp_cfg.get("severity_reset_compaction_auto_backoff_window_seconds") or 1800)
+        if window_seconds < 60:
+            window_seconds = 60
+        events = [x for x in events if x >= (now_ts - window_seconds)]
+        events.append(now_ts)
+        store["severity_reset_compaction_fast_fail_events"] = events
+        if bool(harp_cfg.get("severity_reset_compaction_auto_backoff_enabled")):
+            trigger_count = int(harp_cfg.get("severity_reset_compaction_auto_backoff_trigger_count") or 3)
+            if trigger_count < 1:
+                trigger_count = 1
+            if len(events) >= trigger_count:
+                backoff_seconds = int(harp_cfg.get("severity_reset_compaction_auto_backoff_seconds") or 600)
+                if backoff_seconds < 60:
+                    backoff_seconds = 60
+                store["severity_reset_compaction_webhook_muted_until"] = now_ts + backoff_seconds
+
+    # Track per-anomaly counters + first/last seen timestamps.
+    anomaly_state = store.get("severity_reset_compaction_anomaly_state")
+    if not isinstance(anomaly_state, dict):
+        anomaly_state = {}
+    for code in anomalies:
+        row = anomaly_state.get(code)
+        if not isinstance(row, dict):
+            row = {"count": 0, "first_seen": now_ts, "last_seen": now_ts}
+        row["count"] = int(row.get("count") or 0) + 1
+        row["first_seen"] = float(row.get("first_seen") or now_ts)
+        row["last_seen"] = now_ts
+        row["active"] = True
+        anomaly_state[code] = row
+    for code, row in list(anomaly_state.items()):
+        if not isinstance(row, dict):
+            anomaly_state.pop(code, None)
+            continue
+        row["active"] = code in anomalies
+    store["severity_reset_compaction_anomaly_state"] = anomaly_state
+
+    muted_after_until = float(store.get("severity_reset_compaction_webhook_muted_until") or 0.0)
+    muted_after = muted_after_until > now_ts
+    backoff_transition = None
+    if muted_before != muted_after:
+        backoff_transition = {
+            "timestamp": now_ts,
+            "from": "muted" if muted_before else "normal",
+            "to": "muted" if muted_after else "normal",
+            "muted_until": muted_after_until if muted_after else None,
+        }
+        store["severity_reset_compaction_last_backoff_transition"] = backoff_transition
+        if bool(harp_cfg.get("severity_reset_compaction_backoff_notify_enabled")):
+            dedupe_seconds = int(harp_cfg.get("severity_reset_compaction_backoff_notify_dedupe_seconds") or 300)
+            if dedupe_seconds < 0:
+                dedupe_seconds = 0
+            target_state = "muted" if muted_after else "normal"
+            if _can_emit_backoff_transition_notification(
+                store,
+                target_state=target_state,
+                now_ts=now_ts,
+                dedupe_seconds=dedupe_seconds,
+            ):
+                _send_compaction_alert_webhook(
+                    {
+                        "event_type": "backoff_entered" if muted_after else "backoff_exited",
+                        "timestamp": now_ts,
+                        "muted_until": muted_after_until if muted_after else None,
+                        "warnings": anomalies,
+                    },
+                    harp_cfg,
+                )
+                store["severity_reset_compaction_last_backoff_notify"] = {
+                    "timestamp": now_ts,
+                    "to": target_state,
+                }
+
+    return {
+        "warnings": warnings,
+        "warning_details": warning_details,
+        "active_warning_count": len(warnings),
+        "last_compact_ts": last_compact_ts if last_compact_ts > 0 else None,
+        "rows": len(rows),
+        "partitions": partition_count,
+        "last_webhook_delivery": store.get("severity_reset_last_webhook_delivery"),
+        "webhook_muted_until": (
+            float(store.get("severity_reset_compaction_webhook_muted_until"))
+            if store.get("severity_reset_compaction_webhook_muted_until") is not None
+            else None
+        ),
+        "backoff_transition": backoff_transition,
+        "webhook_slo": slo_all,
+        "webhook_slo_windows": {
+            "all_time": slo_all,
+            "last_1h": slo_1h,
+            "last_24h": slo_24h,
+        },
+        "webhook_slo_anomalies": anomalies,
+        "webhook_anomaly_state": anomaly_state,
+        "unmute_count_24h": unmute_count_24h,
+        "manual_unmute_rate": manual_unmute_rate,
+        "top_unmute_actors_24h": top_unmute_actors_24h,
+    }
+
+
+def _signed_ops_json_response(payload: dict[str, Any], harp_cfg: dict[str, Any]) -> JSONResponse:
+    secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+    if not secret:
+        return JSONResponse(payload)
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    key_id = str(harp_cfg.get("severity_reset_ops_signing_key_id") or "").strip()
+    headers = {"X-HARP-Reset-Audit-Signature": f"sha256={sig}"}
+    if key_id:
+        headers["X-HARP-Reset-Audit-Key-Id"] = key_id
+    return JSONResponse(payload, headers=headers)
+
+
+def _paginate_timestamp_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+    sort: str,
+    cursor: float | None,
+    cursor_token: str | None,
+) -> dict[str, Any]:
+    sort_mode = str(sort or "newest").strip().lower()
+    if sort_mode not in {"newest", "oldest"}:
+        sort_mode = "newest"
+    cursor_key: tuple[float, str] | None = None
+    if cursor_token:
+        try:
+            token_padded = str(cursor_token) + "=" * ((4 - (len(str(cursor_token)) % 4)) % 4)
+            decoded = base64.urlsafe_b64decode(token_padded.encode("ascii")).decode("utf-8")
+            payload = json.loads(decoded)
+            cursor_key = (
+                float((payload or {}).get("timestamp") or 0.0),
+                str((payload or {}).get("cursor_id") or ""),
+            )
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor_token")
+    elif cursor is not None:
+        cursor_key = (float(cursor), "\uffff" if sort_mode == "newest" else "")
+
+    normalized: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        item = dict(row)
+        item["_cursor_key"] = (
+            float(item.get("timestamp") or 0.0),
+            str(item.get("cursor_id") or f"legacy-{idx:08d}"),
+        )
+        normalized.append(item)
+
+    filtered: list[dict[str, Any]] = []
+    for row in normalized:
+        if cursor_key is not None:
+            key = row["_cursor_key"]
+            if sort_mode == "newest" and key >= cursor_key:
+                continue
+            if sort_mode == "oldest" and key <= cursor_key:
+                continue
+        filtered.append(row)
+    filtered.sort(key=lambda item: item["_cursor_key"], reverse=(sort_mode == "newest"))
+    page = filtered[:limit]
+    has_more = len(filtered) > limit
+    next_cursor = None
+    next_cursor_token = None
+    if page and has_more:
+        last_key = page[-1]["_cursor_key"]
+        next_cursor = float(last_key[0])
+        token_raw = json.dumps(
+            {"timestamp": float(last_key[0]), "cursor_id": str(last_key[1])},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        next_cursor_token = base64.urlsafe_b64encode(token_raw).decode("ascii").rstrip("=")
+    return {
+        "rows": [{k: v for k, v in row.items() if k != "_cursor_key"} for row in page],
+        "sort": sort_mode,
+        "limit": limit,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "next_cursor_token": next_cursor_token,
+    }
+
+
+def _send_compaction_alert_webhook(event: dict[str, Any], harp_cfg: dict[str, Any]) -> dict[str, Any]:
+    url = str(harp_cfg.get("severity_reset_compaction_alert_webhook_url") or "").strip()
+    if not url:
+        return {"sent": False, "attempts": 0, "last_error": "webhook_url_not_configured", "latency_ms": None}
+    timeout = int(harp_cfg.get("severity_reset_compaction_alert_webhook_timeout_seconds") or 5)
+    if timeout < 1:
+        timeout = 1
+    if timeout > 30:
+        timeout = 30
+    max_retries = int(harp_cfg.get("severity_reset_compaction_alert_webhook_max_retries") or 1)
+    if max_retries < 0:
+        max_retries = 0
+    if max_retries > 5:
+        max_retries = 5
+    secret = str(harp_cfg.get("severity_reset_compaction_alert_webhook_secret") or "").strip()
+    body = json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        sig = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        headers["X-HARP-Compaction-Alert-Signature"] = f"sha256={sig}"
+
+    attempts = 0
+    last_error = ""
+    started = time.time()
+    while attempts <= max_retries:
+        attempts += 1
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                elapsed_ms = int((time.time() - started) * 1000)
+                return {
+                    "sent": True,
+                    "attempts": attempts,
+                    "last_error": "",
+                    "latency_ms": elapsed_ms,
+                    "status_code": int(getattr(resp, "status", 200) or 200),
+                }
+        except Exception as exc:
+            last_error = str(exc)
+            if attempts > max_retries:
+                elapsed_ms = int((time.time() - started) * 1000)
+                return {
+                    "sent": False,
+                    "attempts": attempts,
+                    "last_error": last_error,
+                    "latency_ms": elapsed_ms,
+                }
+    elapsed_ms = int((time.time() - started) * 1000)
+    return {"sent": False, "attempts": attempts, "last_error": last_error, "latency_ms": elapsed_ms}
+
+
+def _can_emit_backoff_transition_notification(
+    store: dict[str, Any],
+    *,
+    target_state: str,
+    now_ts: float,
+    dedupe_seconds: int,
+) -> bool:
+    last = store.get("severity_reset_compaction_last_backoff_notify")
+    if not isinstance(last, dict):
+        return True
+    last_state = str(last.get("to") or "")
+    last_ts = float(last.get("timestamp") or 0.0)
+    if last_state != target_state:
+        return True
+    if dedupe_seconds <= 0:
+        return True
+    return (now_ts - last_ts) >= dedupe_seconds
+
+
+def _can_emit_verifier_lock_notification(
+    store: dict[str, Any],
+    *,
+    verifier_id: str,
+    target_state: str,
+    now_ts: float,
+    dedupe_seconds: int,
+) -> bool:
+    state = store.get("severity_reset_verify_last_lock_notify")
+    if not isinstance(state, dict):
+        state = {}
+    last = state.get(verifier_id)
+    if not isinstance(last, dict):
+        return True
+    last_state = str(last.get("state") or "")
+    last_ts = float(last.get("timestamp") or 0.0)
+    if last_state != target_state:
+        return True
+    if dedupe_seconds <= 0:
+        return True
+    return (now_ts - last_ts) >= dedupe_seconds
+
+
+def _record_verify_lock_notification_delivery(
+    store: dict[str, Any],
+    harp_cfg: dict[str, Any],
+    *,
+    event_type: str,
+    verifier_id: str,
+    delivery: dict[str, Any],
+) -> None:
+    rows = [item for item in (store.get("severity_reset_verify_lock_notify_audit") or []) if isinstance(item, dict)]
+    rows.append(
+        {
+            "timestamp": time.time(),
+            "event_type": event_type,
+            "verifier_id": verifier_id,
+            "sent": bool(delivery.get("sent")),
+            "attempts": int(delivery.get("attempts") or 0),
+            "last_error": str(delivery.get("last_error") or ""),
+            "latency_ms": (
+                int(delivery.get("latency_ms"))
+                if delivery.get("latency_ms") is not None
+                else None
+            ),
+        }
+    )
+    size = int(harp_cfg.get("severity_reset_verify_lock_notify_audit_size") or 200)
+    if size < 1:
+        size = 1
+    if len(rows) > size:
+        rows = rows[-size:]
+    store["severity_reset_verify_lock_notify_audit"] = rows
+
+
+def _verify_active_lock_alert_dwell_seconds(store: dict[str, Any], now_ts: float) -> float:
+    if not bool(store.get("severity_reset_verify_active_locks_alert_active")):
+        return 0.0
+    rows = [
+        item
+        for item in (store.get("severity_reset_verify_active_locks_alerts") or [])
+        if isinstance(item, dict)
+    ]
+    latest_start = 0.0
+    for row in rows:
+        if bool(row.get("active")):
+            ts = float(row.get("timestamp") or 0.0)
+            if ts > latest_start:
+                latest_start = ts
+    if latest_start <= 0.0:
+        return 0.0
+    return max(0.0, now_ts - latest_start)
+
+
+def _verify_active_lock_alert_dwell_severity(harp_cfg: dict[str, Any], dwell_seconds: float) -> str:
+    if dwell_seconds <= 0:
+        return "none"
+    warn_threshold = int(harp_cfg.get("severity_reset_verify_active_locks_alert_dwell_warn_seconds") or 300)
+    critical_threshold = int(harp_cfg.get("severity_reset_verify_active_locks_alert_dwell_critical_seconds") or 1800)
+    if warn_threshold < 1:
+        warn_threshold = 1
+    if critical_threshold < warn_threshold:
+        critical_threshold = warn_threshold
+    if dwell_seconds >= critical_threshold:
+        return "critical"
+    if dwell_seconds >= warn_threshold:
+        return "warn"
+    return "none"
+
+
+def _redact_unmute_reason(reason: str, pattern: str) -> str:
+    if not pattern:
+        return reason
+    try:
+        return re.sub(pattern, "[REDACTED]", str(reason), flags=re.IGNORECASE)
+    except re.error:
+        return reason
+
+
+@app.post("/api/harp-status/severity-state/reset")
+async def reset_harp_status_severity_state(
+    severity_state_key: str | None = None,
+    actor_tag: str | None = None,
+    reason: str | None = None,
+):
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    allowed_tags = [str(x).strip() for x in (harp_cfg.get("severity_reset_admin_tags") or []) if str(x).strip()]
+    allowed_reasons = [str(x).strip() for x in (harp_cfg.get("severity_reset_allowed_reasons") or []) if str(x).strip()]
+    deny_reason_pattern = str(harp_cfg.get("severity_reset_reason_deny_regex") or "").strip()
+    actor = str(actor_tag or "").strip()
+    reason_text = str(reason or "")
+    allowed = True
+    if allowed_tags and actor not in set(allowed_tags):
+        allowed = False
+    deny_reason_by_taxonomy = False
+    if allowed and allowed_reasons and reason_text not in set(allowed_reasons):
+        deny_reason_by_taxonomy = True
+        allowed = False
+    deny_reason_hit = False
+    if allowed and deny_reason_pattern:
+        try:
+            if re.search(deny_reason_pattern, reason_text, flags=re.IGNORECASE):
+                deny_reason_hit = True
+                allowed = False
+        except re.error:
+            raise HTTPException(status_code=400, detail="Invalid severity_reset_reason_deny_regex in config")
+
+    audit_size = int(harp_cfg.get("severity_reset_audit_size") or 200)
+    if audit_size < 1:
+        audit_size = 1
+    retention_days = int(harp_cfg.get("severity_reset_audit_retention_days") or 30)
+    if retention_days < 0:
+        retention_days = 0
+    scope = "key" if severity_state_key else "all"
+    key_value = str(severity_state_key) if severity_state_key else ""
+    removed = 0
+    if allowed:
+        if severity_state_key:
+            removed = 1 if _HARP_METRICS_SEVERITY_STATE.pop(str(severity_state_key), None) is not None else 0
+        else:
+            removed = len(_HARP_METRICS_SEVERITY_STATE)
+            _HARP_METRICS_SEVERITY_STATE.clear()
+
+    # Persist audit trail (allowed + denied).
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    try:
+        store = {}
+        if status_path.exists():
+            raw = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                store = raw
+        _write_severity_reset_audit(
+            store,
+            row={
+                "audit_id": f"sra-{secrets.token_hex(6)}",
+                "timestamp": time.time(),
+                "allowed": allowed,
+                "actor_tag": actor,
+                "reason": reason_text,
+                "scope": scope,
+                "key": key_value,
+                "removed": removed,
+                "deny_reason_hit": deny_reason_hit,
+                "deny_reason_by_taxonomy": deny_reason_by_taxonomy,
+            },
+            audit_size=audit_size,
+            retention_days=retention_days,
+        )
+        status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    if deny_reason_hit:
+        raise HTTPException(status_code=400, detail="Reset reason denied by severity_reset_reason_deny_regex policy")
+    if deny_reason_by_taxonomy:
+        raise HTTPException(status_code=400, detail="Reset reason not in severity_reset_allowed_reasons policy")
+    if not allowed:
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for severity-state reset")
+    if severity_state_key:
+        return {"ok": True, "removed": removed, "scope": "key", "key": str(severity_state_key), "actor_tag": actor}
+    return {"ok": True, "removed": removed, "scope": "all", "actor_tag": actor}
+
+
+@app.get("/api/harp-status/severity-reset-audit/stats")
+async def get_harp_status_severity_reset_audit_stats(
+    window_hours: int = 24,
+    window_bucket: str = "1h",
+    actor_tag: str | None = None,
+    actor: str | None = None,
+):
+    if window_hours < 1:
+        window_hours = 1
+    if window_hours > 24 * 365:
+        window_hours = 24 * 365
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for severity-reset audit stats")
+    audit: list[dict[str, Any]] = []
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    store_dirty = False
+    if _maybe_auto_compact_severity_reset_audit(store, harp_cfg):
+        try:
+            status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    compaction_health = _evaluate_severity_reset_compaction_drift(store, harp_cfg)
+    try:
+        status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    audit = _read_severity_reset_audit(store)
+    actor_filter = _normalize_actor_tag_with_cfg(actor, harp_cfg)
+    since_ts = time.time() - (window_hours * 3600)
+    bucket_map = {"1m": 60, "5m": 300, "1h": 3600}
+    bucket_seconds = bucket_map.get(str(window_bucket).strip().lower(), 3600)
+    rows = []
+    for idx, item in enumerate(audit):
+        if not isinstance(item, dict):
+            continue
+        row = _normalize_severity_reset_audit_row(item, idx)
+        if actor_filter and _normalize_actor_tag_with_cfg(str(row.get("actor_tag") or ""), harp_cfg) != actor_filter:
+            continue
+        if float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        rows.append(row)
+    totals = {
+        "total": len(rows),
+        "allowed": sum(1 for row in rows if bool(row.get("allowed"))),
+        "denied": sum(1 for row in rows if not bool(row.get("allowed"))),
+        "unique_actors": len({_normalize_actor_tag_with_cfg(str(row.get("actor_tag") or ""), harp_cfg) for row in rows if str(row.get("actor_tag") or "")}),
+    }
+    by_actor: dict[str, dict[str, int]] = {}
+    by_bucket: dict[int, dict[str, int]] = {}
+    for row in rows:
+        key = _normalize_actor_tag_with_cfg(str(row.get("actor_tag") or "unknown"), harp_cfg) or "unknown"
+        cur = by_actor.setdefault(key, {"total": 0, "allowed": 0, "denied": 0})
+        cur["total"] += 1
+        if bool(row.get("allowed")):
+            cur["allowed"] += 1
+        else:
+            cur["denied"] += 1
+        ts = int(float(row.get("timestamp") or 0.0))
+        b = ts - (ts % bucket_seconds)
+        bcur = by_bucket.setdefault(b, {"total": 0, "allowed": 0, "denied": 0})
+        bcur["total"] += 1
+        if bool(row.get("allowed")):
+            bcur["allowed"] += 1
+        else:
+            bcur["denied"] += 1
+    top_actors = sorted(
+        [{"actor_tag": k, **v} for k, v in by_actor.items()],
+        key=lambda item: item["total"],
+        reverse=True,
+    )[:10]
+    series = [
+        {"timestamp": ts, **values}
+        for ts, values in sorted(by_bucket.items(), key=lambda item: item[0])
+    ]
+    payload = {
+        "window_hours": window_hours,
+        "window_bucket": "1m" if bucket_seconds == 60 else "5m" if bucket_seconds == 300 else "1h",
+        "since": since_ts,
+        "totals": totals,
+        "top_actors": top_actors,
+        "series": series,
+        "compaction_health": compaction_health,
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.post("/api/harp-status/severity-reset-audit/compact")
+async def compact_harp_status_severity_reset_audit(
+    dry_run: bool = False,
+    actor_tag: str | None = None,
+):
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        if status_path.exists():
+            raw = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for severity-reset audit compact")
+    audit_size = int(harp_cfg.get("severity_reset_audit_size") or 200)
+    if audit_size < 1:
+        audit_size = 1
+    retention_days = int(harp_cfg.get("severity_reset_audit_retention_days") or 30)
+    if retention_days < 0:
+        retention_days = 0
+
+    before = _read_severity_reset_audit(store)
+    compact_after, partitions = _compact_severity_reset_rows(
+        before,
+        audit_size=audit_size,
+        retention_days=retention_days,
+    )
+    compacted = dict(store)
+    compacted["severity_reset_audit"] = compact_after
+    compacted["severity_reset_audit_partitions"] = partitions
+    _append_severity_reset_compaction_audit(
+        compacted,
+        trigger="manual",
+        actor_tag=str(actor_tag or ""),
+        before=len(before),
+        after=len(compact_after),
+        partitions=len(partitions),
+        max_size=int(harp_cfg.get("severity_reset_compaction_audit_size") or 100),
+    )
+    compaction_health = _evaluate_severity_reset_compaction_drift(compacted, harp_cfg)
+    if not dry_run:
+        status_path.write_text(json.dumps(compacted, indent=2), encoding="utf-8")
+    payload = {
+        "ok": True,
+        "dry_run": bool(dry_run),
+        "before": len(before),
+        "after": len(compact_after),
+        "partitions": len(partitions),
+        "compaction_health": compaction_health,
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.post("/api/harp-status/severity-reset-audit/webhook-unmute")
+async def unmute_harp_status_severity_reset_webhook(
+    actor_tag: str | None = None,
+    reason: str | None = None,
+):
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        if status_path.exists():
+            raw = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for webhook unmute")
+    reason_text = str(reason or "")
+    allowed_reasons = [str(x).strip() for x in (harp_cfg.get("severity_reset_unmute_allowed_reasons") or []) if str(x).strip()]
+    deny_reason_pattern = str(harp_cfg.get("severity_reset_unmute_reason_deny_regex") or "").strip()
+    if allowed_reasons and reason_text not in set(allowed_reasons):
+        raise HTTPException(status_code=400, detail="Unmute reason not in severity_reset_unmute_allowed_reasons policy")
+    if deny_reason_pattern:
+        try:
+            if re.search(deny_reason_pattern, reason_text, flags=re.IGNORECASE):
+                raise HTTPException(status_code=400, detail="Unmute reason denied by severity_reset_unmute_reason_deny_regex policy")
+        except re.error:
+            raise HTTPException(status_code=400, detail="Invalid severity_reset_unmute_reason_deny_regex in config")
+    now_ts = time.time()
+    prev_until = float(store.get("severity_reset_compaction_webhook_muted_until") or 0.0)
+    was_muted = prev_until > now_ts
+    store["severity_reset_compaction_webhook_muted_until"] = 0.0
+    audit = list(store.get("severity_reset_compaction_unmute_audit") or [])
+    audit.append(
+        {
+            "timestamp": now_ts,
+            "actor_tag": str(actor_tag or ""),
+            "reason": reason_text,
+            "was_muted": was_muted,
+            "previous_muted_until": prev_until if prev_until > 0 else None,
+        }
+    )
+    audit_size = int(harp_cfg.get("severity_reset_compaction_unmute_audit_size") or 100)
+    if audit_size < 1:
+        audit_size = 1
+    if len(audit) > audit_size:
+        audit = audit[-audit_size:]
+    store["severity_reset_compaction_unmute_audit"] = audit
+    if was_muted:
+        store["severity_reset_compaction_last_backoff_transition"] = {
+            "timestamp": now_ts,
+            "from": "muted",
+            "to": "normal",
+            "muted_until": None,
+        }
+        if bool(harp_cfg.get("severity_reset_compaction_backoff_notify_enabled")):
+            dedupe_seconds = int(harp_cfg.get("severity_reset_compaction_backoff_notify_dedupe_seconds") or 300)
+            if dedupe_seconds < 0:
+                dedupe_seconds = 0
+            if _can_emit_backoff_transition_notification(
+                store,
+                target_state="normal",
+                now_ts=now_ts,
+                dedupe_seconds=dedupe_seconds,
+            ):
+                _send_compaction_alert_webhook(
+                    {
+                        "event_type": "backoff_exited",
+                        "timestamp": now_ts,
+                        "muted_until": None,
+                        "reason": "manual_unmute",
+                    },
+                    harp_cfg,
+                )
+                store["severity_reset_compaction_last_backoff_notify"] = {
+                    "timestamp": now_ts,
+                    "to": "normal",
+                }
+    status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    payload = {"ok": True, "was_muted": was_muted, "previous_muted_until": prev_until if prev_until > 0 else None}
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/unmute-audit")
+async def get_harp_status_severity_reset_unmute_audit(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    sort_by: str = "timestamp",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    was_muted: str | None = None,
+    reason_contains: str | None = None,
+    actor_tag: str | None = None,
+    actor: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for unmute audit")
+    actor_filter = _normalize_actor_tag_with_cfg(actor, harp_cfg)
+    since_ts = float(since) if since is not None else None
+    was_muted_filter = str(was_muted or "").strip().lower()
+    reason_filter = str(reason_contains or "").strip().lower()
+    rows = [item for item in (store.get("severity_reset_compaction_unmute_audit") or []) if isinstance(item, dict)]
+    filtered: list[dict[str, Any]] = []
+    redact_pattern = str(harp_cfg.get("severity_reset_unmute_reason_redact_regex") or "").strip()
+    for row in rows:
+        if actor_filter and _normalize_actor_tag_with_cfg(str(row.get("actor_tag") or ""), harp_cfg) != actor_filter:
+            continue
+        if since_ts is not None and float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        if was_muted_filter in {"true", "false"}:
+            want = was_muted_filter == "true"
+            if bool(row.get("was_muted")) is not want:
+                continue
+        shaped = dict(row)
+        shaped["reason"] = _redact_unmute_reason(str(shaped.get("reason") or ""), redact_pattern)
+        if reason_filter and reason_filter not in str(shaped.get("reason") or "").lower():
+            continue
+        filtered.append(shaped)
+    sort_by_mode = str(sort_by or "timestamp").strip().lower()
+    if sort_by_mode in {"actor_tag", "reason"}:
+        sort_mode = str(sort or "newest").strip().lower()
+        if sort_mode not in {"newest", "oldest"}:
+            sort_mode = "newest"
+        cursor_key: tuple[str, float, str] | None = None
+        if cursor_token:
+            try:
+                token_padded = str(cursor_token) + "=" * ((4 - (len(str(cursor_token)) % 4)) % 4)
+                decoded = base64.urlsafe_b64decode(token_padded.encode("ascii")).decode("utf-8")
+                payload = json.loads(decoded)
+                cursor_key = (
+                    str((payload or {}).get("primary_key") or ""),
+                    float((payload or {}).get("timestamp") or 0.0),
+                    str((payload or {}).get("cursor_id") or ""),
+                )
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid cursor_token")
+        normalized = []
+        for idx, row in enumerate(filtered):
+            item = dict(row)
+            primary_key = (
+                _normalize_actor_tag(str(item.get("actor_tag") or ""))
+                if sort_by_mode == "actor_tag"
+                else str(item.get("reason") or "").strip().lower()[:128]
+            )
+            item["_cursor_key"] = (
+                primary_key,
+                float(item.get("timestamp") or 0.0),
+                str(item.get("cursor_id") or f"legacy-{idx:08d}"),
+            )
+            normalized.append(item)
+        sortable = normalized
+        if cursor_key is not None:
+            if sort_mode == "newest":
+                sortable = [row for row in sortable if row["_cursor_key"] < cursor_key]
+            else:
+                sortable = [row for row in sortable if row["_cursor_key"] > cursor_key]
+        sortable.sort(key=lambda item: item["_cursor_key"], reverse=(sort_mode == "newest"))
+        page_rows = sortable[:effective_limit]
+        has_more = len(sortable) > effective_limit
+        next_cursor = None
+        next_cursor_token = None
+        if page_rows and has_more:
+            last_key = page_rows[-1]["_cursor_key"]
+            next_cursor = float(last_key[1])
+            token_raw = json.dumps(
+                {"primary_key": last_key[0], "timestamp": float(last_key[1]), "cursor_id": last_key[2]},
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            next_cursor_token = base64.urlsafe_b64encode(token_raw).decode("ascii").rstrip("=")
+        page = {
+            "rows": [{k: v for k, v in row.items() if k != "_cursor_key"} for row in page_rows],
+            "sort": sort_mode,
+            "limit": effective_limit,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "next_cursor_token": next_cursor_token,
+        }
+    else:
+        page = _paginate_timestamp_rows(
+            filtered,
+            limit=effective_limit,
+            sort=sort,
+            cursor=cursor,
+            cursor_token=cursor_token,
+        )
+    payload = {
+        "audit": page["rows"],
+        "sort_by": sort_by_mode,
+        "sort": page["sort"],
+        "limit": page["limit"],
+        "has_more": page["has_more"],
+        "next_cursor": page["next_cursor"],
+        "next_cursor_token": page["next_cursor_token"],
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/compaction-audit")
+async def get_harp_status_severity_reset_compaction_audit(
+    tail: int = 20,
+    actor_tag: str | None = None,
+    trigger: str | None = None,
+    since: float | None = None,
+):
+    if tail < 1:
+        tail = 1
+    if tail > 500:
+        tail = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for compaction audit")
+    rows = [item for item in (store.get("severity_reset_compaction_audit") or []) if isinstance(item, dict)]
+    trig = str(trigger or "").strip().lower()
+    since_ts = float(since) if since is not None else None
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if trig and str(row.get("trigger") or "").lower() != trig:
+            continue
+        if since_ts is not None and float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        filtered.append(row)
+    payload = {"audit": filtered[-tail:]}
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/compaction-alerts")
+async def get_harp_status_severity_reset_compaction_alerts(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor_tag: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for compaction alerts")
+    rows = [item for item in (store.get("severity_reset_compaction_alerts") or []) if isinstance(item, dict)]
+    since_ts = float(since) if since is not None else None
+    filtered = rows
+    if since_ts is not None:
+        filtered = [row for row in filtered if float(row.get("timestamp") or 0.0) >= since_ts]
+    page = _paginate_timestamp_rows(
+        filtered,
+        limit=effective_limit,
+        sort=sort,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    payload = {
+        "alerts": page["rows"],
+        "sort": page["sort"],
+        "limit": page["limit"],
+        "has_more": page["has_more"],
+        "next_cursor": page["next_cursor"],
+        "next_cursor_token": page["next_cursor_token"],
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/compaction-webhook-audit")
+async def get_harp_status_severity_reset_compaction_webhook_audit(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    sent: str | None = None,
+    min_latency_ms: int | None = None,
+    error_contains: str | None = None,
+    actor_tag: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for compaction webhook audit")
+    rows = [item for item in (store.get("severity_reset_compaction_webhook_audit") or []) if isinstance(item, dict)]
+    since_ts = float(since) if since is not None else None
+    sort_mode = str(sort or "newest").strip().lower()
+    filtered = rows
+    if since_ts is not None:
+        filtered = [row for row in filtered if float(row.get("timestamp") or 0.0) >= since_ts]
+    sent_filter = str(sent or "").strip().lower()
+    if sent_filter in {"true", "false"}:
+        want_sent = sent_filter == "true"
+        filtered = [row for row in filtered if bool(row.get("sent")) is want_sent]
+    if min_latency_ms is not None:
+        filtered = [
+            row for row in filtered
+            if row.get("latency_ms") is not None and int(row.get("latency_ms") or 0) >= int(min_latency_ms)
+        ]
+    err_filter = str(error_contains or "").strip().lower()
+    if err_filter:
+        filtered = [
+            row for row in filtered
+            if err_filter in str(row.get("last_error") or "").lower()
+        ]
+    page = _paginate_timestamp_rows(
+        filtered,
+        limit=effective_limit,
+        sort=sort_mode,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    payload = {
+        "audit": page["rows"],
+        "sort": page["sort"],
+        "limit": page["limit"],
+        "has_more": page["has_more"],
+        "next_cursor": page["next_cursor"],
+        "next_cursor_token": page["next_cursor_token"],
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/export")
+async def export_harp_status_severity_reset_audit(
+    stream: str = "alerts",
+    format: str = "json",
+    tail: int = 50,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor_tag: str | None = None,
+    verifier_id: str | None = None,
+    since: float | None = None,
+    sent: str | None = None,
+    min_latency_ms: int | None = None,
+    error_contains: str | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 1000:
+        effective_limit = 1000
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for compaction export")
+    since_ts = float(since) if since is not None else None
+    stream_mode = str(stream or "alerts").strip().lower()
+    if stream_mode not in {"alerts", "webhook", "unmute", "verify_unlock"}:
+        raise HTTPException(status_code=400, detail="stream must be alerts, webhook, unmute, or verify_unlock")
+
+    if stream_mode == "alerts":
+        rows = [item for item in (store.get("severity_reset_compaction_alerts") or []) if isinstance(item, dict)]
+        if since_ts is not None:
+            rows = [row for row in rows if float(row.get("timestamp") or 0.0) >= since_ts]
+    elif stream_mode == "webhook":
+        rows = [item for item in (store.get("severity_reset_compaction_webhook_audit") or []) if isinstance(item, dict)]
+        if since_ts is not None:
+            rows = [row for row in rows if float(row.get("timestamp") or 0.0) >= since_ts]
+        sent_filter = str(sent or "").strip().lower()
+        if sent_filter in {"true", "false"}:
+            want_sent = sent_filter == "true"
+            rows = [row for row in rows if bool(row.get("sent")) is want_sent]
+        if min_latency_ms is not None:
+            rows = [
+                row for row in rows
+                if row.get("latency_ms") is not None and int(row.get("latency_ms") or 0) >= int(min_latency_ms)
+            ]
+        err_filter = str(error_contains or "").strip().lower()
+        if err_filter:
+            rows = [row for row in rows if err_filter in str(row.get("last_error") or "").lower()]
+    else:
+        if stream_mode == "unmute":
+            rows = [item for item in (store.get("severity_reset_compaction_unmute_audit") or []) if isinstance(item, dict)]
+            if since_ts is not None:
+                rows = [row for row in rows if float(row.get("timestamp") or 0.0) >= since_ts]
+            redact_pattern = str(harp_cfg.get("severity_reset_unmute_reason_redact_regex") or "").strip()
+            shaped_rows = []
+            for row in rows:
+                shaped = dict(row)
+                shaped["reason"] = _redact_unmute_reason(str(shaped.get("reason") or ""), redact_pattern)
+                shaped_rows.append(shaped)
+            rows = shaped_rows
+        else:
+            rows = [item for item in (store.get("severity_reset_verify_unlock_audit") or []) if isinstance(item, dict)]
+            if since_ts is not None:
+                rows = [row for row in rows if float(row.get("timestamp") or 0.0) >= since_ts]
+            verifier_filter = _normalize_verifier_id_with_cfg(verifier_id, harp_cfg)
+            if verifier_filter:
+                rows = [
+                    row
+                    for row in rows
+                    if _normalize_verifier_id_with_cfg(str(row.get("verifier_id") or ""), harp_cfg) == verifier_filter
+                ]
+            err_filter = str(error_contains or "").strip().lower()
+            if err_filter:
+                rows = [row for row in rows if err_filter in str(row.get("reason") or "").lower()]
+
+    page = _paginate_timestamp_rows(
+        rows,
+        limit=effective_limit,
+        sort=sort,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    if str(format or "json").strip().lower() == "json":
+        payload = {
+            "stream": stream_mode,
+            "rows": page["rows"],
+            "sort": page["sort"],
+            "limit": page["limit"],
+            "has_more": page["has_more"],
+            "next_cursor": page["next_cursor"],
+            "next_cursor_token": page["next_cursor_token"],
+        }
+        digest_input = json.dumps(
+            {
+                "stream": stream_mode,
+                "row_count": len(page["rows"]),
+                "has_more": page["has_more"],
+                "next_cursor": page["next_cursor"],
+                "next_cursor_token": page["next_cursor_token"],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        page_digest = hashlib.sha256(digest_input).hexdigest()
+        headers = {"X-HARP-Reset-Audit-Page-Digest": f"sha256={page_digest}"}
+        secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+        if secret:
+            body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            sig = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+            headers["X-HARP-Reset-Audit-Signature"] = f"sha256={sig}"
+            key_id = str(harp_cfg.get("severity_reset_ops_signing_key_id") or "").strip()
+            if key_id:
+                headers["X-HARP-Reset-Audit-Key-Id"] = key_id
+        return JSONResponse(payload, headers=headers)
+    if str(format or "json").strip().lower() != "csv":
+        raise HTTPException(status_code=400, detail="format must be json or csv")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    if stream_mode == "alerts":
+        writer.writerow(["timestamp", "warnings", "warning_details", "rows", "partitions", "high_severity"])
+        for row in page["rows"]:
+            writer.writerow([
+                row.get("timestamp"),
+                "|".join(str(x) for x in (row.get("warnings") or [])),
+                "|".join(
+                    f"{str(x.get('code') or '')}:{str(x.get('severity') or '')}"
+                    for x in (row.get("warning_details") or [])
+                    if isinstance(x, dict)
+                ),
+                row.get("rows"),
+                row.get("partitions"),
+                row.get("high_severity"),
+            ])
+    elif stream_mode == "webhook":
+        writer.writerow(["timestamp", "warnings", "attempts", "sent", "latency_ms", "last_error"])
+        for row in page["rows"]:
+            writer.writerow([
+                row.get("timestamp"),
+                "|".join(str(x) for x in (row.get("warnings") or [])),
+                row.get("attempts"),
+                row.get("sent"),
+                row.get("latency_ms"),
+                row.get("last_error"),
+            ])
+    elif stream_mode == "unmute":
+        writer.writerow(["timestamp", "actor_tag", "reason", "was_muted", "previous_muted_until"])
+        for row in page["rows"]:
+            writer.writerow([
+                row.get("timestamp"),
+                row.get("actor_tag"),
+                row.get("reason"),
+                row.get("was_muted"),
+                row.get("previous_muted_until"),
+            ])
+    else:
+        writer.writerow(["timestamp", "actor_tag", "verifier_id", "reason", "was_locked", "previous_locked_until"])
+        for row in page["rows"]:
+            writer.writerow([
+                row.get("timestamp"),
+                row.get("actor_tag"),
+                row.get("verifier_id"),
+                row.get("reason"),
+                row.get("was_locked"),
+                row.get("previous_locked_until"),
+            ])
+    csv_body = output.getvalue()
+    headers = {
+        "Content-Disposition": f'attachment; filename="harp-compaction-{stream_mode}.csv"',
+        "X-HARP-Next-Cursor": str(page.get("next_cursor") or ""),
+        "X-HARP-Next-Cursor-Token": str(page.get("next_cursor_token") or ""),
+    }
+    secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+    if secret:
+        sig = hmac.new(secret.encode("utf-8"), csv_body.encode("utf-8"), hashlib.sha256).hexdigest()
+        headers["X-HARP-Reset-Audit-Signature"] = f"sha256={sig}"
+        key_id = str(harp_cfg.get("severity_reset_ops_signing_key_id") or "").strip()
+        if key_id:
+            headers["X-HARP-Reset-Audit-Key-Id"] = key_id
+    return Response(content=csv_body, media_type="text/csv", headers=headers)
+
+
+@app.get("/api/harp-status/severity-reset-audit/verify-export-page-digest")
+async def verify_harp_status_severity_reset_export_page_digest(
+    actor_tag: str | None = None,
+    stream: str = "alerts",
+    row_count: int = 0,
+    has_more: str = "false",
+    next_cursor: float | None = None,
+    next_cursor_token: str | None = None,
+    digest: str = "",
+    verifier_id: str | None = None,
+    nonce: str | None = None,
+    issue_receipt: str = "false",
+):
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for digest verification")
+    verifier = _normalize_verifier_id_with_cfg(verifier_id, harp_cfg)
+    allowed_verifiers = {
+        _normalize_verifier_id_with_cfg(str(x), harp_cfg)
+        for x in (harp_cfg.get("severity_reset_verify_allowed_verifiers") or [])
+        if str(x).strip()
+    }
+    if allowed_verifiers and verifier not in allowed_verifiers:
+        raise HTTPException(status_code=403, detail="verifier_id is not authorized for digest verification")
+    now_ts = time.time()
+    verifier_locks = store.get("severity_reset_verify_verifier_locks")
+    if not isinstance(verifier_locks, dict):
+        verifier_locks = {}
+    unlock_ts = float(verifier_locks.get(verifier) or 0.0) if verifier else 0.0
+    if verifier and unlock_ts > now_ts:
+        raise HTTPException(status_code=423, detail="verifier_id is temporarily locked due to duplicate nonce violations")
+    if verifier and unlock_ts > 0.0 and unlock_ts <= now_ts:
+        verifier_locks.pop(verifier, None)
+        store["severity_reset_verify_verifier_locks"] = verifier_locks
+        store_dirty = True
+        if bool(harp_cfg.get("severity_reset_verify_lock_notify_enabled")):
+            dedupe_seconds = int(harp_cfg.get("severity_reset_verify_lock_notify_dedupe_seconds") or 300)
+            if dedupe_seconds < 0:
+                dedupe_seconds = 0
+            suppress_seconds = int(harp_cfg.get("severity_reset_verify_auto_unlock_notify_suppression_seconds") or 300)
+            if suppress_seconds < 0:
+                suppress_seconds = 0
+            suppress_map = store.get("severity_reset_verify_last_auto_unlock_notify")
+            if not isinstance(suppress_map, dict):
+                suppress_map = {}
+            last_auto = float(suppress_map.get(verifier) or 0.0)
+            if _can_emit_verifier_lock_notification(
+                store,
+                verifier_id=verifier,
+                target_state="unlocked",
+                now_ts=now_ts,
+                dedupe_seconds=dedupe_seconds,
+            ) and (suppress_seconds == 0 or (now_ts - last_auto) >= suppress_seconds):
+                delivery = _send_compaction_alert_webhook(
+                    {
+                        "event_type": "verifier_lock_auto_exited",
+                        "timestamp": now_ts,
+                        "verifier_id": verifier,
+                    },
+                    harp_cfg,
+                )
+                _record_verify_lock_notification_delivery(
+                    store,
+                    harp_cfg,
+                    event_type="verifier_lock_auto_exited",
+                    verifier_id=verifier,
+                    delivery=delivery,
+                )
+                suppress_map[verifier] = now_ts
+                store["severity_reset_verify_last_auto_unlock_notify"] = suppress_map
+                notify_state = store.get("severity_reset_verify_last_lock_notify")
+                if not isinstance(notify_state, dict):
+                    notify_state = {}
+                notify_state[verifier] = {"state": "unlocked", "timestamp": now_ts}
+                store["severity_reset_verify_last_lock_notify"] = notify_state
+    digest_input = json.dumps(
+        {
+            "stream": str(stream or "alerts").strip().lower(),
+            "row_count": int(row_count),
+            "has_more": str(has_more or "false").strip().lower() == "true",
+            "next_cursor": float(next_cursor) if next_cursor is not None else None,
+            "next_cursor_token": str(next_cursor_token or "") or None,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    expected = f"sha256={hashlib.sha256(digest_input).hexdigest()}"
+    provided = str(digest or "").strip()
+    ok = bool(provided) and hmac.compare_digest(provided, expected)
+    nonce_text = str(nonce or "").strip()
+    duplicate_nonce = False
+    if nonce_text:
+        window_seconds = int(harp_cfg.get("severity_reset_verify_nonce_window_seconds") or 3600)
+        if window_seconds < 1:
+            window_seconds = 1
+        nonce_cache = [item for item in (store.get("severity_reset_verify_nonce_cache") or []) if isinstance(item, dict)]
+        cutoff = now_ts - window_seconds
+        nonce_cache = [item for item in nonce_cache if float(item.get("timestamp") or 0.0) >= cutoff]
+        if any(str(item.get("nonce") or "") == nonce_text for item in nonce_cache):
+            duplicate_nonce = True
+            ok = False
+            store["severity_reset_verify_nonce_duplicates"] = int(store.get("severity_reset_verify_nonce_duplicates") or 0) + 1
+            dup_by_stream = store.get("severity_reset_verify_nonce_duplicates_by_stream")
+            if not isinstance(dup_by_stream, dict):
+                dup_by_stream = {}
+            stream_key = str(stream or "alerts").strip().lower()
+            dup_by_stream[stream_key] = int(dup_by_stream.get(stream_key) or 0) + 1
+            store["severity_reset_verify_nonce_duplicates_by_stream"] = dup_by_stream
+            duplicate_events = [
+                item
+                for item in (store.get("severity_reset_verify_nonce_duplicate_events") or [])
+                if isinstance(item, dict)
+            ]
+            duplicate_events.append(
+                {
+                    "timestamp": now_ts,
+                    "stream": stream_key,
+                    "verifier_id": verifier,
+                    "nonce": nonce_text,
+                }
+            )
+            history_seconds = int(harp_cfg.get("severity_reset_verify_nonce_event_history_seconds") or 86400)
+            if history_seconds < 60:
+                history_seconds = 60
+            history_cutoff = now_ts - history_seconds
+            duplicate_events = [item for item in duplicate_events if float(item.get("timestamp") or 0.0) >= history_cutoff]
+            history_size = int(harp_cfg.get("severity_reset_verify_nonce_event_history_size") or 5000)
+            if history_size < 1:
+                history_size = 1
+            if len(duplicate_events) > history_size:
+                duplicate_events = duplicate_events[-history_size:]
+            alert_window = int(harp_cfg.get("severity_reset_verify_nonce_alert_window_seconds") or 600)
+            if alert_window < 1:
+                alert_window = 1
+            store["severity_reset_verify_nonce_duplicate_events"] = duplicate_events
+
+            alert_threshold = int(harp_cfg.get("severity_reset_verify_nonce_alert_threshold") or 0)
+            if alert_threshold > 0:
+                alert_cutoff = now_ts - alert_window
+                stream_hits = sum(
+                    1
+                    for item in duplicate_events
+                    if str(item.get("stream") or "") == stream_key
+                    and float(item.get("timestamp") or 0.0) >= alert_cutoff
+                )
+                if stream_hits >= alert_threshold:
+                    alerts = [item for item in (store.get("severity_reset_verify_nonce_alerts") or []) if isinstance(item, dict)]
+                    alerts.append(
+                        {
+                            "timestamp": now_ts,
+                            "stream": stream_key,
+                            "count": stream_hits,
+                            "window_seconds": alert_window,
+                        }
+                    )
+                    alerts_size = int(harp_cfg.get("severity_reset_verify_nonce_alerts_size") or 100)
+                    if alerts_size < 1:
+                        alerts_size = 1
+                    if len(alerts) > alerts_size:
+                        alerts = alerts[-alerts_size:]
+                    store["severity_reset_verify_nonce_alerts"] = alerts
+
+            if verifier and bool(harp_cfg.get("severity_reset_verify_verifier_auto_lock_enabled")):
+                lock_window = int(harp_cfg.get("severity_reset_verify_verifier_auto_lock_window_seconds") or 3600)
+                if lock_window < 1:
+                    lock_window = 1
+                lock_threshold = int(harp_cfg.get("severity_reset_verify_verifier_auto_lock_threshold") or 5)
+                if lock_threshold < 1:
+                    lock_threshold = 1
+                verifier_hits = sum(
+                    1
+                    for item in duplicate_events
+                    if str(item.get("verifier_id") or "") == verifier
+                    and float(item.get("timestamp") or 0.0) >= (now_ts - lock_window)
+                )
+                if verifier_hits >= lock_threshold:
+                    lock_seconds = int(harp_cfg.get("severity_reset_verify_verifier_lock_seconds") or 1800)
+                    if lock_seconds < 1:
+                        lock_seconds = 1
+                    verifier_locks[verifier] = now_ts + lock_seconds
+                    store["severity_reset_verify_verifier_locks"] = verifier_locks
+                    lock_audit = [item for item in (store.get("severity_reset_verify_lock_audit") or []) if isinstance(item, dict)]
+                    lock_audit.append(
+                        {
+                            "timestamp": now_ts,
+                            "action": "locked",
+                            "verifier_id": verifier,
+                            "locked_until": verifier_locks[verifier],
+                        }
+                    )
+                    lock_audit_size = int(harp_cfg.get("severity_reset_verify_lock_audit_size") or 500)
+                    if lock_audit_size < 1:
+                        lock_audit_size = 1
+                    if len(lock_audit) > lock_audit_size:
+                        lock_audit = lock_audit[-lock_audit_size:]
+                    store["severity_reset_verify_lock_audit"] = lock_audit
+                    if bool(harp_cfg.get("severity_reset_verify_lock_notify_enabled")):
+                        dedupe_seconds = int(harp_cfg.get("severity_reset_verify_lock_notify_dedupe_seconds") or 300)
+                        if dedupe_seconds < 0:
+                            dedupe_seconds = 0
+                        if _can_emit_verifier_lock_notification(
+                            store,
+                            verifier_id=verifier,
+                            target_state="locked",
+                            now_ts=now_ts,
+                            dedupe_seconds=dedupe_seconds,
+                        ):
+                            delivery = _send_compaction_alert_webhook(
+                                {
+                                    "event_type": "verifier_lock_entered",
+                                    "timestamp": now_ts,
+                                    "verifier_id": verifier,
+                                    "locked_until": verifier_locks[verifier],
+                                },
+                                harp_cfg,
+                            )
+                            _record_verify_lock_notification_delivery(
+                                store,
+                                harp_cfg,
+                                event_type="verifier_lock_entered",
+                                verifier_id=verifier,
+                                delivery=delivery,
+                            )
+                            notify_state = store.get("severity_reset_verify_last_lock_notify")
+                            if not isinstance(notify_state, dict):
+                                notify_state = {}
+                            notify_state[verifier] = {"state": "locked", "timestamp": now_ts}
+                            store["severity_reset_verify_last_lock_notify"] = notify_state
+        else:
+            nonce_cache.append({"nonce": nonce_text, "timestamp": now_ts})
+            cache_size = int(harp_cfg.get("severity_reset_verify_nonce_cache_size") or 1000)
+            if cache_size < 1:
+                cache_size = 1
+            if len(nonce_cache) > cache_size:
+                nonce_cache = nonce_cache[-cache_size:]
+            store["severity_reset_verify_nonce_cache"] = nonce_cache
+    receipt = None
+    if ok and str(issue_receipt or "false").strip().lower() == "true":
+        verified_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        receipt = {
+            "stream": str(stream or "alerts").strip().lower(),
+            "row_count": int(row_count),
+            "has_more": str(has_more or "false").strip().lower() == "true",
+            "next_cursor": float(next_cursor) if next_cursor is not None else None,
+            "next_cursor_token": str(next_cursor_token or "") or None,
+            "digest": provided,
+            "verified_at": verified_at,
+            "verifier_id": verifier,
+            "nonce": str(nonce or ""),
+        }
+        secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+        if secret:
+            receipt_body = json.dumps(receipt, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            receipt["signature"] = f"sha256={hmac.new(secret.encode('utf-8'), receipt_body, hashlib.sha256).hexdigest()}"
+        audit = list(store.get("severity_reset_export_verify_audit") or [])
+        audit.append(
+            {
+                "timestamp": time.time(),
+                "actor_tag": str(actor_tag or ""),
+                "ok": ok,
+                "stream": str(stream or "alerts").strip().lower(),
+                "digest": provided,
+                "verifier_id": verifier,
+                "nonce": str(nonce or ""),
+            }
+        )
+        audit_size = int(harp_cfg.get("severity_reset_verify_audit_size") or 100)
+        if audit_size < 1:
+            audit_size = 1
+        if len(audit) > audit_size:
+            audit = audit[-audit_size:]
+        store["severity_reset_export_verify_audit"] = audit
+        try:
+            status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    if nonce_text or store_dirty:
+        try:
+            status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    payload = {
+        "ok": ok,
+        "expected_digest": expected,
+        "provided_digest": provided or None,
+        "duplicate_nonce": duplicate_nonce,
+        "nonce_duplicate_count": int(store.get("severity_reset_verify_nonce_duplicates") or 0),
+        "receipt": receipt,
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/verify-audit")
+async def get_harp_status_severity_reset_verify_audit(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor_tag: str | None = None,
+    verifier_id: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for verify audit")
+    verifier_filter = _normalize_verifier_id_with_cfg(verifier_id, harp_cfg)
+    allowed_verifiers = {
+        _normalize_verifier_id_with_cfg(str(x), harp_cfg)
+        for x in (harp_cfg.get("severity_reset_verify_allowed_verifiers") or [])
+        if str(x).strip()
+    }
+    if allowed_verifiers and verifier_filter and verifier_filter not in allowed_verifiers:
+        raise HTTPException(status_code=403, detail="verifier_id is not authorized for verify audit")
+    since_ts = float(since) if since is not None else None
+    rows = [item for item in (store.get("severity_reset_export_verify_audit") or []) if isinstance(item, dict)]
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if verifier_filter and _normalize_verifier_id_with_cfg(str(row.get("verifier_id") or ""), harp_cfg) != verifier_filter:
+            continue
+        if since_ts is not None and float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        filtered.append(row)
+    page = _paginate_timestamp_rows(
+        filtered,
+        limit=effective_limit,
+        sort=sort,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    payload = {
+        "audit": page["rows"],
+        "sort": page["sort"],
+        "limit": page["limit"],
+        "has_more": page["has_more"],
+        "next_cursor": page["next_cursor"],
+        "next_cursor_token": page["next_cursor_token"],
+        "nonce_duplicate_count": int(store.get("severity_reset_verify_nonce_duplicates") or 0),
+        "nonce_duplicate_count_by_stream": store.get("severity_reset_verify_nonce_duplicates_by_stream") or {},
+        "active_verifier_locks": store.get("severity_reset_verify_verifier_locks") or {},
+        "duplicate_heatmap": {},
+        "lock_summary": {
+            "locked_verifier_count": 0,
+            "soonest_unlock_at": None,
+            "lock_entries_24h": 0,
+            "lock_entries_windows": {"last_1h": 0, "last_24h": 0, "last_7d": 0},
+            "active_locks_alert_dwell_seconds": 0.0,
+            "active_locks_alert_dwell_severity": "none",
+        },
+        "lock_notify_metrics": {
+            "attempted": 0,
+            "sent": 0,
+            "failed": 0,
+            "success_rate": 0.0,
+            "p95_latency_ms": None,
+            "windows": {
+                "last_1h": {"attempted": 0, "sent": 0, "failed": 0, "success_rate": 0.0, "p95_latency_ms": None},
+                "last_24h": {"attempted": 0, "sent": 0, "failed": 0, "success_rate": 0.0, "p95_latency_ms": None},
+            },
+        },
+    }
+    now_ts = time.time()
+    events = [item for item in (store.get("severity_reset_verify_nonce_duplicate_events") or []) if isinstance(item, dict)]
+    heatmap: dict[str, dict[str, int]] = {}
+    for row in events:
+        verifier = _normalize_verifier_id_with_cfg(str(row.get("verifier_id") or ""), harp_cfg) or "unknown"
+        ts = float(row.get("timestamp") or 0.0)
+        bucket = heatmap.setdefault(verifier, {"last_10m": 0, "last_1h": 0, "last_24h": 0})
+        if ts >= now_ts - 600:
+            bucket["last_10m"] += 1
+        if ts >= now_ts - 3600:
+            bucket["last_1h"] += 1
+        if ts >= now_ts - 86400:
+            bucket["last_24h"] += 1
+    payload["duplicate_heatmap"] = heatmap
+    locks_raw = store.get("severity_reset_verify_verifier_locks")
+    locks = locks_raw if isinstance(locks_raw, dict) else {}
+    active_unlock_times = [float(v) for v in locks.values() if float(v) > now_ts]
+    lock_audit = [item for item in (store.get("severity_reset_verify_lock_audit") or []) if isinstance(item, dict)]
+    lock_entries_24h = sum(
+        1
+        for row in lock_audit
+        if str(row.get("action") or "") == "locked" and float(row.get("timestamp") or 0.0) >= (now_ts - 86400)
+    )
+    lock_entries_1h = sum(
+        1
+        for row in lock_audit
+        if str(row.get("action") or "") == "locked" and float(row.get("timestamp") or 0.0) >= (now_ts - 3600)
+    )
+    lock_entries_7d = sum(
+        1
+        for row in lock_audit
+        if str(row.get("action") or "") == "locked" and float(row.get("timestamp") or 0.0) >= (now_ts - 86400 * 7)
+    )
+    payload["lock_summary"] = {
+        "locked_verifier_count": len(active_unlock_times),
+        "soonest_unlock_at": min(active_unlock_times) if active_unlock_times else None,
+        "lock_entries_24h": lock_entries_24h,
+        "lock_entries_windows": {
+            "last_1h": lock_entries_1h,
+            "last_24h": lock_entries_24h,
+            "last_7d": lock_entries_7d,
+        },
+    }
+    notify_rows = [item for item in (store.get("severity_reset_verify_lock_notify_audit") or []) if isinstance(item, dict)]
+
+    def _notify_metrics(rows_local: list[dict[str, Any]]) -> dict[str, Any]:
+        attempted_local = len(rows_local)
+        sent_local = sum(1 for row in rows_local if bool(row.get("sent")))
+        failed_local = attempted_local - sent_local
+        lats_local = sorted(
+            int(row.get("latency_ms"))
+            for row in rows_local
+            if row.get("latency_ms") is not None
+        )
+        p95_local = None
+        if lats_local:
+            idx_local = max(0, min(len(lats_local) - 1, int(round(0.95 * (len(lats_local) - 1)))))
+            p95_local = lats_local[idx_local]
+        return {
+            "attempted": attempted_local,
+            "sent": sent_local,
+            "failed": failed_local,
+            "success_rate": (sent_local / attempted_local) if attempted_local > 0 else 0.0,
+            "p95_latency_ms": p95_local,
+        }
+
+    notify_all = _notify_metrics(notify_rows)
+    notify_1h = _notify_metrics(
+        [row for row in notify_rows if float(row.get("timestamp") or 0.0) >= (now_ts - 3600)]
+    )
+    notify_24h = _notify_metrics(
+        [row for row in notify_rows if float(row.get("timestamp") or 0.0) >= (now_ts - 86400)]
+    )
+    payload["lock_notify_metrics"] = {
+        **notify_all,
+        "windows": {
+            "last_1h": notify_1h,
+            "last_24h": notify_24h,
+        },
+    }
+    active_locks_threshold = int(harp_cfg.get("severity_reset_verify_active_locks_alert_threshold") or 0)
+    if active_locks_threshold > 0:
+        active_count = payload["lock_summary"]["locked_verifier_count"]
+        alert_active = active_count > active_locks_threshold
+        prev_active = bool(store.get("severity_reset_verify_active_locks_alert_active"))
+        if alert_active != prev_active:
+            alerts = [item for item in (store.get("severity_reset_verify_active_locks_alerts") or []) if isinstance(item, dict)]
+            alerts.append(
+                {
+                    "cursor_id": f"vlock-alert-{int(now_ts * 1000)}-{secrets.token_hex(4)}",
+                    "timestamp": now_ts,
+                    "active": alert_active,
+                    "locked_verifier_count": active_count,
+                    "threshold": active_locks_threshold,
+                }
+            )
+            alerts_size = int(harp_cfg.get("severity_reset_verify_active_locks_alerts_size") or 100)
+            if alerts_size < 1:
+                alerts_size = 1
+            if len(alerts) > alerts_size:
+                alerts = alerts[-alerts_size:]
+            store["severity_reset_verify_active_locks_alerts"] = alerts
+            store["severity_reset_verify_active_locks_alert_active"] = alert_active
+            try:
+                status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        payload["lock_summary"]["active_locks_alert"] = alert_active
+        payload["lock_summary"]["active_locks_threshold"] = active_locks_threshold
+        dwell_seconds = _verify_active_lock_alert_dwell_seconds(store, now_ts)
+        payload["lock_summary"]["active_locks_alert_dwell_seconds"] = dwell_seconds
+        payload["lock_summary"]["active_locks_alert_dwell_severity"] = _verify_active_lock_alert_dwell_severity(
+            harp_cfg, dwell_seconds
+        )
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/verify-lock-audit")
+async def get_harp_status_severity_reset_verify_lock_audit(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor_tag: str | None = None,
+    verifier_id: str | None = None,
+    action: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for verify lock audit")
+    verifier_filter = _normalize_verifier_id_with_cfg(verifier_id, harp_cfg)
+    action_filter = str(action or "").strip().lower()
+    since_ts = float(since) if since is not None else None
+    rows = [item for item in (store.get("severity_reset_verify_lock_audit") or []) if isinstance(item, dict)]
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if verifier_filter and _normalize_verifier_id_with_cfg(str(row.get("verifier_id") or ""), harp_cfg) != verifier_filter:
+            continue
+        if action_filter and str(row.get("action") or "").strip().lower() != action_filter:
+            continue
+        if since_ts is not None and float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        filtered.append(row)
+    page = _paginate_timestamp_rows(
+        filtered,
+        limit=effective_limit,
+        sort=sort,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    payload = {
+        "audit": page["rows"],
+        "sort": page["sort"],
+        "limit": page["limit"],
+        "has_more": page["has_more"],
+        "next_cursor": page["next_cursor"],
+        "next_cursor_token": page["next_cursor_token"],
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/verify-lock-alerts")
+async def get_harp_status_severity_reset_verify_lock_alerts(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor_tag: str | None = None,
+    active: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for verify lock alerts")
+    since_ts = float(since) if since is not None else None
+    active_filter = str(active or "").strip().lower()
+    rows = [item for item in (store.get("severity_reset_verify_active_locks_alerts") or []) if isinstance(item, dict)]
+    filtered = []
+    for row in rows:
+        if since_ts is not None and float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        if active_filter in {"true", "false"}:
+            want_active = active_filter == "true"
+            if bool(row.get("active")) is not want_active:
+                continue
+        filtered.append(row)
+    page = _paginate_timestamp_rows(
+        filtered,
+        limit=effective_limit,
+        sort=sort,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    current_dwell = _verify_active_lock_alert_dwell_seconds(store, time.time())
+    payload = {
+        "alerts": page["rows"],
+        "sort": page["sort"],
+        "limit": page["limit"],
+        "has_more": page["has_more"],
+        "next_cursor": page["next_cursor"],
+        "next_cursor_token": page["next_cursor_token"],
+        "current_active": bool(store.get("severity_reset_verify_active_locks_alert_active")),
+        "current_active_dwell_seconds": current_dwell,
+        "current_active_dwell_severity": _verify_active_lock_alert_dwell_severity(harp_cfg, current_dwell),
+        "threshold": int(harp_cfg.get("severity_reset_verify_active_locks_alert_threshold") or 0),
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/verify-lock-alerts/export")
+async def export_harp_status_severity_reset_verify_lock_alerts(
+    format: str = "json",
+    tail: int = 200,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor_tag: str | None = None,
+    active: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 1000:
+        effective_limit = 1000
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for verify lock alerts export")
+    since_ts = float(since) if since is not None else None
+    active_filter = str(active or "").strip().lower()
+    rows = [item for item in (store.get("severity_reset_verify_active_locks_alerts") or []) if isinstance(item, dict)]
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if since_ts is not None and float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        if active_filter in {"true", "false"}:
+            want_active = active_filter == "true"
+            if bool(row.get("active")) is not want_active:
+                continue
+        filtered.append(row)
+    page = _paginate_timestamp_rows(
+        filtered,
+        limit=effective_limit,
+        sort=sort,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    current_dwell = _verify_active_lock_alert_dwell_seconds(store, time.time())
+    if str(format or "json").strip().lower() == "json":
+        payload = {
+            "alerts": page["rows"],
+            "sort": page["sort"],
+            "limit": page["limit"],
+            "has_more": page["has_more"],
+            "next_cursor": page["next_cursor"],
+            "next_cursor_token": page["next_cursor_token"],
+            "current_active": bool(store.get("severity_reset_verify_active_locks_alert_active")),
+            "current_active_dwell_seconds": current_dwell,
+            "current_active_dwell_severity": _verify_active_lock_alert_dwell_severity(harp_cfg, current_dwell),
+            "threshold": int(harp_cfg.get("severity_reset_verify_active_locks_alert_threshold") or 0),
+        }
+        digest_input = json.dumps(
+            {
+                "stream": "verify_lock_alerts",
+                "row_count": len(page["rows"]),
+                "has_more": page["has_more"],
+                "next_cursor": page["next_cursor"],
+                "next_cursor_token": page["next_cursor_token"],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        page_digest = hashlib.sha256(digest_input).hexdigest()
+        headers = {"X-HARP-Reset-Audit-Page-Digest": f"sha256={page_digest}"}
+        secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+        if secret:
+            body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            sig = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+            headers["X-HARP-Reset-Audit-Signature"] = f"sha256={sig}"
+            key_id = str(harp_cfg.get("severity_reset_ops_signing_key_id") or "").strip()
+            if key_id:
+                headers["X-HARP-Reset-Audit-Key-Id"] = key_id
+        return JSONResponse(payload, headers=headers)
+    if str(format or "json").strip().lower() != "csv":
+        raise HTTPException(status_code=400, detail="format must be json or csv")
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["timestamp", "active", "locked_verifier_count", "threshold", "cursor_id"])
+    for row in page["rows"]:
+        writer.writerow(
+            [
+                row.get("timestamp"),
+                row.get("active"),
+                row.get("locked_verifier_count"),
+                row.get("threshold"),
+                row.get("cursor_id"),
+            ]
+        )
+    body = out.getvalue()
+    headers = {
+        "Content-Disposition": 'attachment; filename="harp-verify-lock-alerts.csv"',
+        "X-HARP-Next-Cursor": str(page.get("next_cursor") or ""),
+        "X-HARP-Next-Cursor-Token": str(page.get("next_cursor_token") or ""),
+    }
+    secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+    if secret:
+        sig = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+        headers["X-HARP-Reset-Audit-Signature"] = f"sha256={sig}"
+        key_id = str(harp_cfg.get("severity_reset_ops_signing_key_id") or "").strip()
+        if key_id:
+            headers["X-HARP-Reset-Audit-Key-Id"] = key_id
+    return Response(content=body, media_type="text/csv", headers=headers)
+
+
+@app.get("/api/harp-status/severity-reset-audit/verify-lock-bundle/export")
+async def export_harp_status_severity_reset_verify_lock_bundle(
+    format: str = "json",
+    tail: int = 200,
+    actor_tag: str | None = None,
+):
+    if tail < 1:
+        tail = 1
+    if tail > 2000:
+        tail = 2000
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for verify lock bundle export")
+    lock_audit = [item for item in (store.get("severity_reset_verify_lock_audit") or []) if isinstance(item, dict)][-tail:]
+    notify_audit = [item for item in (store.get("severity_reset_verify_lock_notify_audit") or []) if isinstance(item, dict)][-tail:]
+    if str(format or "json").strip().lower() == "json":
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "lock_audit": lock_audit,
+            "notify_audit": notify_audit,
+        }
+        digest_input = json.dumps(
+            {"lock_count": len(lock_audit), "notify_count": len(notify_audit)},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        digest = hashlib.sha256(digest_input).hexdigest()
+        headers = {"X-HARP-Reset-Audit-Page-Digest": f"sha256={digest}"}
+        secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+        if secret:
+            body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            sig = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+            headers["X-HARP-Reset-Audit-Signature"] = f"sha256={sig}"
+            key_id = str(harp_cfg.get("severity_reset_ops_signing_key_id") or "").strip()
+            if key_id:
+                headers["X-HARP-Reset-Audit-Key-Id"] = key_id
+        return JSONResponse(payload, headers=headers)
+    if str(format or "json").strip().lower() != "csv":
+        raise HTTPException(status_code=400, detail="format must be json or csv")
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["kind", "timestamp", "action_or_event", "verifier_id", "sent", "attempts", "latency_ms", "error"])
+    for row in lock_audit:
+        writer.writerow([
+            "lock_audit",
+            row.get("timestamp"),
+            row.get("action"),
+            row.get("verifier_id"),
+            "",
+            "",
+            "",
+            "",
+        ])
+    for row in notify_audit:
+        writer.writerow([
+            "notify_audit",
+            row.get("timestamp"),
+            row.get("event_type"),
+            row.get("verifier_id"),
+            row.get("sent"),
+            row.get("attempts"),
+            row.get("latency_ms"),
+            row.get("last_error"),
+        ])
+    body = out.getvalue()
+    headers = {"Content-Disposition": 'attachment; filename="harp-verify-lock-bundle.csv"'}
+    secret = str(harp_cfg.get("severity_reset_ops_signing_secret") or "").strip()
+    if secret:
+        sig = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+        headers["X-HARP-Reset-Audit-Signature"] = f"sha256={sig}"
+    return Response(content=body, media_type="text/csv", headers=headers)
+
+
+@app.post("/api/harp-status/severity-reset-audit/verify-verifier-unlock")
+async def unlock_harp_status_severity_reset_verifier(
+    actor_tag: str | None = None,
+    verifier_id: str | None = None,
+    reason: str | None = None,
+):
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        if status_path.exists():
+            raw = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for verifier unlock")
+    verifier = _normalize_verifier_id_with_cfg(verifier_id, harp_cfg)
+    if not verifier:
+        raise HTTPException(status_code=400, detail="verifier_id is required")
+    reason_text = str(reason or "")
+    allowed_reasons = [str(x).strip() for x in (harp_cfg.get("severity_reset_verify_unlock_allowed_reasons") or []) if str(x).strip()]
+    deny_reason_pattern = str(harp_cfg.get("severity_reset_verify_unlock_reason_deny_regex") or "").strip()
+    if allowed_reasons and reason_text not in set(allowed_reasons):
+        raise HTTPException(status_code=400, detail="Verifier unlock reason not in severity_reset_verify_unlock_allowed_reasons policy")
+    if deny_reason_pattern:
+        try:
+            if re.search(deny_reason_pattern, reason_text, flags=re.IGNORECASE):
+                raise HTTPException(status_code=400, detail="Verifier unlock reason denied by severity_reset_verify_unlock_reason_deny_regex policy")
+        except re.error:
+            raise HTTPException(status_code=400, detail="Invalid severity_reset_verify_unlock_reason_deny_regex in config")
+    locks = store.get("severity_reset_verify_verifier_locks")
+    if not isinstance(locks, dict):
+        locks = {}
+    prev_until = float(locks.get(verifier) or 0.0)
+    was_locked = prev_until > time.time()
+    locks.pop(verifier, None)
+    store["severity_reset_verify_verifier_locks"] = locks
+    audit = [item for item in (store.get("severity_reset_verify_unlock_audit") or []) if isinstance(item, dict)]
+    audit.append(
+        {
+            "timestamp": time.time(),
+            "actor_tag": str(actor_tag or ""),
+            "verifier_id": verifier,
+            "reason": reason_text,
+            "was_locked": was_locked,
+            "previous_locked_until": prev_until if prev_until > 0 else None,
+        }
+    )
+    audit_size = int(harp_cfg.get("severity_reset_verify_unlock_audit_size") or 100)
+    if audit_size < 1:
+        audit_size = 1
+    if len(audit) > audit_size:
+        audit = audit[-audit_size:]
+    store["severity_reset_verify_unlock_audit"] = audit
+    lock_audit = [item for item in (store.get("severity_reset_verify_lock_audit") or []) if isinstance(item, dict)]
+    lock_audit.append(
+        {
+            "timestamp": time.time(),
+            "action": "unlocked",
+            "verifier_id": verifier,
+            "locked_until": None,
+        }
+    )
+    lock_audit_size = int(harp_cfg.get("severity_reset_verify_lock_audit_size") or 500)
+    if lock_audit_size < 1:
+        lock_audit_size = 1
+    if len(lock_audit) > lock_audit_size:
+        lock_audit = lock_audit[-lock_audit_size:]
+    store["severity_reset_verify_lock_audit"] = lock_audit
+    if was_locked and bool(harp_cfg.get("severity_reset_verify_lock_notify_enabled")):
+        now_ts = time.time()
+        dedupe_seconds = int(harp_cfg.get("severity_reset_verify_lock_notify_dedupe_seconds") or 300)
+        if dedupe_seconds < 0:
+            dedupe_seconds = 0
+        if _can_emit_verifier_lock_notification(
+            store,
+            verifier_id=verifier,
+            target_state="unlocked",
+            now_ts=now_ts,
+            dedupe_seconds=dedupe_seconds,
+        ):
+            delivery = _send_compaction_alert_webhook(
+                {
+                    "event_type": "verifier_lock_exited",
+                    "timestamp": now_ts,
+                    "verifier_id": verifier,
+                    "reason": "manual_unlock",
+                },
+                harp_cfg,
+            )
+            _record_verify_lock_notification_delivery(
+                store,
+                harp_cfg,
+                event_type="verifier_lock_exited",
+                verifier_id=verifier,
+                delivery=delivery,
+            )
+            notify_state = store.get("severity_reset_verify_last_lock_notify")
+            if not isinstance(notify_state, dict):
+                notify_state = {}
+            notify_state[verifier] = {"state": "unlocked", "timestamp": now_ts}
+            store["severity_reset_verify_last_lock_notify"] = notify_state
+    status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    payload = {"ok": True, "was_locked": was_locked, "previous_locked_until": prev_until if prev_until > 0 else None}
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit/verify-verifier-unlock-audit")
+async def get_harp_status_severity_reset_verify_unlock_audit(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor_tag: str | None = None,
+    verifier_id: str | None = None,
+    since: float | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if not _severity_reset_actor_allowed(harp_cfg, actor_tag):
+        raise HTTPException(status_code=403, detail="actor_tag is not authorized for verify unlock audit")
+    verifier_filter = _normalize_verifier_id_with_cfg(verifier_id, harp_cfg)
+    since_ts = float(since) if since is not None else None
+    rows = [item for item in (store.get("severity_reset_verify_unlock_audit") or []) if isinstance(item, dict)]
+    filtered = []
+    for row in rows:
+        if verifier_filter and _normalize_verifier_id_with_cfg(str(row.get("verifier_id") or ""), harp_cfg) != verifier_filter:
+            continue
+        if since_ts is not None and float(row.get("timestamp") or 0.0) < since_ts:
+            continue
+        filtered.append(row)
+    page = _paginate_timestamp_rows(
+        filtered,
+        limit=effective_limit,
+        sort=sort,
+        cursor=cursor,
+        cursor_token=cursor_token,
+    )
+    payload = {
+        "audit": page["rows"],
+        "sort": page["sort"],
+        "limit": page["limit"],
+        "has_more": page["has_more"],
+        "next_cursor": page["next_cursor"],
+        "next_cursor_token": page["next_cursor_token"],
+    }
+    return _signed_ops_json_response(payload, harp_cfg)
+
+
+@app.get("/api/harp-status/severity-reset-audit")
+async def get_harp_status_severity_reset_audit(
+    tail: int = 20,
+    limit: int | None = None,
+    sort: str = "newest",
+    cursor: float | None = None,
+    cursor_token: str | None = None,
+    actor: str | None = None,
+    allowed: str | None = None,
+    since: float | None = None,
+    viewer_tag: str | None = None,
+):
+    effective_limit = int(limit if limit is not None else tail)
+    if effective_limit < 1:
+        effective_limit = 1
+    if effective_limit > 500:
+        effective_limit = 500
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    store: dict[str, Any] = {}
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            store = raw
+    except Exception:
+        store = {}
+    cfg = load_config() or {}
+    harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(harp_cfg, dict):
+        harp_cfg = {}
+    if _maybe_auto_compact_severity_reset_audit(store, harp_cfg):
+        try:
+            status_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    audit = _read_severity_reset_audit(store)
+    privileged_tags = {
+        str(x).strip()
+        for x in ((harp_cfg or {}).get("severity_reset_reason_privileged_tags") or [])
+        if str(x).strip()
+    }
+    partial_tags = {
+        str(x).strip()
+        for x in ((harp_cfg or {}).get("severity_reset_reason_partial_tags") or [])
+        if str(x).strip()
+    }
+    preview_chars = int((harp_cfg or {}).get("severity_reset_reason_preview_chars") or 12)
+    if preview_chars < 1:
+        preview_chars = 1
+    if preview_chars > 128:
+        preview_chars = 128
+    viewer = str(viewer_tag or "").strip()
+    if not privileged_tags and not partial_tags:
+        reason_visibility = "full"
+    elif viewer in privileged_tags:
+        reason_visibility = "full"
+    elif viewer in partial_tags:
+        reason_visibility = "partial"
+    else:
+        reason_visibility = "masked"
+
+    actor_filter = _normalize_actor_tag_with_cfg(actor, harp_cfg)
+    allowed_filter = str(allowed or "").strip().lower()
+    since_ts = float(since) if since is not None else None
+    sort_mode = str(sort or "newest").strip().lower()
+    if sort_mode not in {"newest", "oldest"}:
+        sort_mode = "newest"
+    cursor_secret = str((harp_cfg or {}).get("severity_reset_cursor_signing_secret") or "").strip()
+    cursor_key: tuple[float, str] | None = None
+    if cursor_token:
+        try:
+            token_padded = str(cursor_token) + "=" * ((4 - (len(str(cursor_token)) % 4)) % 4)
+            decoded = base64.urlsafe_b64decode(token_padded.encode("ascii")).decode("utf-8")
+            payload = json.loads(decoded)
+            token_ts = float((payload or {}).get("timestamp") or 0.0)
+            token_id = str((payload or {}).get("audit_id") or "")
+            token_sig = str((payload or {}).get("sig") or "")
+            if cursor_secret:
+                if not token_sig:
+                    raise HTTPException(status_code=400, detail="Unsigned cursor_token not allowed")
+                expected = _cursor_sign(token_ts, token_id, cursor_secret)
+                if not hmac.compare_digest(token_sig, expected):
+                    raise HTTPException(status_code=400, detail="Invalid cursor_token signature")
+            cursor_key = (
+                token_ts,
+                token_id,
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor_token")
+    elif cursor is not None:
+        # Backward-compatible timestamp-only cursor: skip rows at/after the
+        # boundary for newest pagination and at/before for oldest.
+        fallback_id = "\uffff" if sort_mode == "newest" else ""
+        cursor_key = (float(cursor), fallback_id)
+
+    def _with_cursor_key(item: dict[str, Any], idx: int) -> dict[str, Any]:
+        row = _normalize_severity_reset_audit_row(item, idx)
+        row["_cursor_key"] = (float(row.get("timestamp") or 0.0), str(row.get("audit_id") or ""))
+        return row
+
+    normalized = [_with_cursor_key(item, idx) for idx, item in enumerate(audit)]
+    base_filtered: list[dict[str, Any]] = []
+    for item in normalized:
+        if actor_filter and _normalize_actor_tag(str(item.get("actor_tag") or "")) != actor_filter:
+            continue
+        if allowed_filter in {"true", "false"}:
+            want_allowed = allowed_filter == "true"
+            if bool(item.get("allowed")) is not want_allowed:
+                continue
+        if since_ts is not None and float(item.get("timestamp") or 0.0) < since_ts:
+            continue
+        base_filtered.append(item)
+
+    filtered: list[dict[str, Any]] = []
+    for item in base_filtered:
+        key = item["_cursor_key"]
+        if cursor_key is not None:
+            if sort_mode == "newest" and key >= cursor_key:
+                continue
+            if sort_mode == "oldest" and key <= cursor_key:
+                continue
+        filtered.append(item)
+    filtered.sort(key=lambda row: row["_cursor_key"], reverse=(sort_mode == "newest"))
+    page = filtered[:effective_limit]
+    has_more = len(filtered) > effective_limit
+    shaped_page: list[dict[str, Any]] = []
+    for row in page:
+        shaped_row = {k: v for k, v in row.items() if k != "_cursor_key"}
+        reason_text = str(shaped_row.get("reason") or "")
+        if reason_visibility == "masked":
+            shaped_row["reason"] = "[MASKED]"
+            shaped_row["reason_masked"] = True
+        elif reason_visibility == "partial":
+            if len(reason_text) > preview_chars:
+                shaped_row["reason"] = f"{reason_text[:preview_chars]}…[MASKED]"
+            shaped_row["reason_masked"] = True
+        else:
+            shaped_row["reason_masked"] = False
+        shaped_page.append(shaped_row)
+    next_cursor = None
+    next_cursor_token = None
+    if page:
+        last_key = page[-1]["_cursor_key"]
+        next_cursor = float(last_key[0])
+        token_payload = {"timestamp": float(last_key[0]), "audit_id": str(last_key[1])}
+        if cursor_secret:
+            token_payload["sig"] = _cursor_sign(float(last_key[0]), str(last_key[1]), cursor_secret)
+        token_raw = json.dumps(token_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        next_cursor_token = base64.urlsafe_b64encode(token_raw).decode("ascii").rstrip("=")
+    if not has_more:
+        next_cursor = None
+        next_cursor_token = None
+    return {
+        "audit": shaped_page,
+        "sort": sort_mode,
+        "limit": effective_limit,
+        "has_more": has_more,
+        "total_estimate": len(base_filtered),
+        "next_cursor": next_cursor,
+        "next_cursor_token": next_cursor_token,
+        "reason_visible": reason_visibility == "full",
+        "reason_visibility": reason_visibility,
+    }
+
+
+@app.get("/api/harp-status/ops-snapshot/export")
+async def export_harp_status_ops_snapshot(format: str = "json", tail: int = 50):
+    if tail < 1:
+        tail = 1
+    if tail > 1000:
+        tail = 1000
+    status_path = get_hermes_home() / "harp-routing-status.json"
+    lint_history: list[dict[str, Any]] = []
+    reset_audit: list[dict[str, Any]] = []
+    try:
+        raw = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            if isinstance(raw.get("lint_history"), list):
+                lint_history = [item for item in raw.get("lint_history") if isinstance(item, dict)]
+            reset_audit = _read_severity_reset_audit(raw)
+    except Exception:
+        pass
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "severity_state": _HARP_METRICS_SEVERITY_STATE,
+        "lint_history": lint_history[-tail:],
+        "severity_reset_audit": reset_audit[-tail:],
+    }
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    secret = ""
+    key_id = ""
+    key_version = "v1"
+    key_deprecated = False
+    redact_pattern = ""
+    try:
+        cfg = load_config() or {}
+        harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+        if isinstance(harp_cfg, dict):
+            secret = str(
+                os.getenv("HARP_EXPORT_SIGNING_SECRET")
+                or harp_cfg.get("alert_export_signing_secret")
+                or harp_cfg.get("alert_webhook_secret")
+                or ""
+            )
+            key_id = str(harp_cfg.get("alert_export_signing_key_id") or "")
+            key_version = str(harp_cfg.get("alert_export_signing_key_version") or "v1")
+            key_deprecated = bool(harp_cfg.get("alert_export_signing_key_deprecated") or False)
+            redact_pattern = str(harp_cfg.get("severity_reset_reason_redact_regex") or "").strip()
+    except Exception:
+        pass
+
+    if redact_pattern:
+        try:
+            redacted: list[dict[str, Any]] = []
+            for item in reset_audit:
+                row = dict(item)
+                row["reason"] = re.sub(redact_pattern, "[REDACTED]", str(row.get("reason") or ""), flags=re.IGNORECASE)
+                redacted.append(row)
+            reset_audit = redacted
+        except re.error:
+            # Fail-open on invalid redaction regex to preserve export availability.
+            pass
+    payload["severity_reset_audit"] = reset_audit[-tail:]
+    if str(format).lower() == "csv":
+        def _esc(value: Any) -> str:
+            return '"' + str(value or "").replace('"', '""') + '"'
+
+        rows = ["category,timestamp,key,status,details"]
+        for item in payload["lint_history"]:
+            rows.append(
+                ",".join(
+                    [
+                        _esc("lint_history"),
+                        _esc(item.get("timestamp")),
+                        _esc(""),
+                        _esc("ok" if item.get("ok") else "fail"),
+                        _esc(",".join(item.get("reason_codes") or [])),
+                    ]
+                )
+            )
+        for item in payload["severity_reset_audit"]:
+            rows.append(
+                ",".join(
+                    [
+                        _esc("severity_reset_audit"),
+                        _esc(item.get("timestamp")),
+                        _esc(item.get("key")),
+                        _esc("allowed" if item.get("allowed") else "denied"),
+                        _esc(item.get("actor_tag") or item.get("reason")),
+                    ]
+                )
+            )
+        content = "\n".join(rows)
+        checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        manifest = f"{generated_at}:{checksum}"
+        headers = {
+            "Content-Disposition": f'attachment; filename="harp-ops-snapshot-{stamp}.csv"',
+            "X-HARP-Export-Generated-At": generated_at,
+            "X-HARP-Export-Checksum-SHA256": checksum,
+        }
+        if secret:
+            resolved_key_id = key_id or hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+            sig = hmac.new(
+                secret.encode("utf-8"),
+                manifest.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-HARP-Export-Signature"] = f"sha256={sig}"
+            headers["X-HARP-Export-Key-Id"] = resolved_key_id
+            headers["X-HARP-Export-Key-Alg"] = "hmac-sha256"
+            headers["X-HARP-Export-Key-Version"] = key_version
+            headers["X-HARP-Export-Key-Deprecated"] = "true" if key_deprecated else "false"
+        return Response(content=content, media_type="text/csv", headers=headers)
+    content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    manifest = f"{generated_at}:{checksum}"
+    headers = {
+        "Content-Disposition": f'attachment; filename="harp-ops-snapshot-{stamp}.json"',
+        "X-HARP-Export-Generated-At": generated_at,
+        "X-HARP-Export-Checksum-SHA256": checksum,
+    }
+    if secret:
+        resolved_key_id = key_id or hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+        sig = hmac.new(
+            secret.encode("utf-8"),
+            manifest.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        headers["X-HARP-Export-Signature"] = f"sha256={sig}"
+        headers["X-HARP-Export-Key-Id"] = resolved_key_id
+        headers["X-HARP-Export-Key-Alg"] = "hmac-sha256"
+        headers["X-HARP-Export-Key-Version"] = key_version
+        headers["X-HARP-Export-Key-Deprecated"] = "true" if key_deprecated else "false"
+    return Response(content=content, media_type="application/json", headers=headers)
 
 
 @app.get("/api/system/stats")
