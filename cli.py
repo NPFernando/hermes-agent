@@ -211,8 +211,19 @@ def _strip_reasoning_tags(text: str) -> str:
     content (``<tool_call>``, ``<function_calls>``, Gemma-style
     ``<function name="…">…</function>``). Ported from
     openclaw/openclaw#67318.
+
+    Some models (deepseek, nemotron) emit a stylised box-drawn reasoning
+    block using Unicode box-drawing characters:
+      ┌─ Reasoning ──────────────────────────────┐
+      ┊ content                                  ┊
+      └───────────────────────────────────────────┘
+    Strip the entire block, including the ┊ tool-call indicators.
     """
-    cleaned = text
+    cleaned = re.sub(
+        r"(?m)^┌─ Reasoning .*\n(?:.*\n)*?^└─.*$",
+        "",
+        text,
+    )
     for tag in _REASONING_TAGS:
         # Closed pair — case-insensitive so <THINK>…</THINK> is handled too.
         cleaned = re.sub(
@@ -2695,6 +2706,14 @@ _SGR_MOUSE_VISIBLE_RE = re.compile(r"\^\[\[<\d+;\d+;\d+[Mm]")
 # these fragments are extremely unlikely to be intentional user input, and
 # stripping them is better than sending corrupted prompts.
 _SGR_MOUSE_BARE_RE = re.compile(r"<\d+;\d+;\d+[Mm]")
+# When the terminal ESC[< prefix is fully stripped through multiple layers of
+# filtering, only the coordinate triple remains: "0;130;45M". These are
+# extremely unlikely in normal user input — coordinates in terminal space are
+# small integers (0..200 or so), and the "digit;semicolons;digitM/m" structure
+# doesn't appear in prose. Match it as a last resort.
+_SGR_MOUSE_PLAIN_RE = re.compile(r"\d{1,4};\d{1,5};\d{1,5}[Mm]")
+# Most degraded: even the first coordinate is stripped, leaving ";col;rowM"
+_SGR_MOUSE_PLAIN_TAIL_RE = re.compile(r";\d{1,5};\d{1,5}[Mm]")
 _TERMINAL_INPUT_MODE_RESET_SEQ = (
     "\x1b[?1006l"  # disable SGR mouse
     "\x1b[?1003l"  # disable any-motion tracking
@@ -2796,7 +2815,13 @@ def _strip_leaked_terminal_responses_with_meta(text: str) -> tuple[str, bool]:
     has_esc = "\x1b[" in text
     has_visible = "^[" in text
     has_bare_mouse = "<" in text and ";" in text and ("M" in text or "m" in text)
-    if not (has_esc or has_visible or has_bare_mouse):
+    # Fully degraded form: no ESC, no <, just "0;130;45M" triples.
+    # Check independently of has_bare_mouse so a broad "<" match doesn't
+    # block the plain-mouse regex when the exact bare format isn't present.
+    has_plain_mouse = bool(
+        _SGR_MOUSE_PLAIN_RE.search(text) or _SGR_MOUSE_PLAIN_TAIL_RE.search(text)
+    )
+    if not (has_esc or has_visible or has_bare_mouse or has_plain_mouse):
         return text, False
 
     had_mouse_reports = False
@@ -2815,6 +2840,15 @@ def _strip_leaked_terminal_responses_with_meta(text: str) -> tuple[str, bool]:
         text, count = _SGR_MOUSE_BARE_RE.subn("", text)
         had_mouse_reports = had_mouse_reports or count > 0
 
+    if has_plain_mouse:
+        text, count = _SGR_MOUSE_PLAIN_RE.subn("", text)
+        had_mouse_reports = had_mouse_reports or count > 0
+        # Clean up fragments where even the first coordinate is missing
+        text, count = _SGR_MOUSE_PLAIN_TAIL_RE.subn("", text)
+        had_mouse_reports = had_mouse_reports or count > 0
+        # Final pass: strip orphaned "nM[" or "nm[" fragments left after
+        # coordinate stripping (e.g. "50M[0;112;50M" → "50M[" residue)
+        text = re.sub(r"\d+[Mm]\[", "", text)
     return text, had_mouse_reports
 
 

@@ -47,6 +47,18 @@ class TestToolCallStripping:
         assert "reasoning" not in result
         assert "answer" in result
 
+    def test_box_drawn_reasoning_block_is_stripped(self):
+        text = (
+            "┌─ Reasoning ───────────────────┐\n"
+            "┊ hidden <tool_call>{\"name\": \"secret\"}</tool_call> ┊\n"
+            "└───────────────────────────────┘\n"
+            "Visible answer"
+        )
+        result = _strip_reasoning_tags(text)
+        assert "hidden" not in result
+        assert "secret" not in result
+        assert "Visible answer" in result
+
     def test_mixed_reasoning_and_tool_call(self):
         text = '<think>plan</think><tool_call>{"x":1}</tool_call>final'
         result = _strip_reasoning_tags(text)

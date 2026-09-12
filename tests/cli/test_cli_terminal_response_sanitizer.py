@@ -76,6 +76,18 @@ class TestStripLeakedTerminalResponses:
         text = "<65;1;49M<35;1;42Mhello<64;1;40m"
         assert _strip_leaked_terminal_responses(text) == "hello"
 
+    def test_strips_sgr_mouse_report_after_escape_prefix_was_removed(self):
+        text = "abc0;130;45Mdef"
+        assert _strip_leaked_terminal_responses(text) == "abcdef"
+
+    def test_strips_sgr_mouse_report_after_button_code_was_removed(self):
+        text = "abc;130;45Mdef"
+        assert _strip_leaked_terminal_responses(text) == "abcdef"
+
+    def test_does_not_strip_bracketed_prose_for_unrelated_semicolon_and_m(self):
+        text = "See [1; M is a field label"
+        assert _strip_leaked_terminal_responses(text) == text
+
     def test_does_not_strip_regular_angle_bracket_text(self):
         text = "render <div class='hero'> literal"
         assert _strip_leaked_terminal_responses(text) == text
