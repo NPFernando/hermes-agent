@@ -3832,14 +3832,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # changes mid-session, so the TUI would show a stale name after
         # _try_activate_fallback() switches provider/model.
         agent = getattr(self, "agent", None)
-        model_name = (getattr(agent, "model", None) or self.model or "unknown")
+        model_name = (getattr(agent, "model", None) or getattr(self, "model", None) or "unknown")
         model_short = model_name.split("/")[-1] if "/" in model_name else model_name
         if model_short.endswith(".gguf"):
             model_short = model_short[:-5]
         if len(model_short) > 26:
             model_short = f"{model_short[:23]}..."
 
-        elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
+        session_start = getattr(self, "session_start", None) or datetime.now()
+        elapsed_seconds = max(0.0, (datetime.now() - session_start).total_seconds())
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
@@ -5520,7 +5521,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             f"Agent Running: {'Yes' if is_running else 'No'}",
         ])
         # Add context info bar if available
-        snapshot = self._take_context_snapshot()
+        snapshot = self._get_status_bar_snapshot()
         if snapshot:
             ctx_pct = snapshot.get("context_percent")
             if ctx_pct is not None:
@@ -10113,14 +10114,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _handle_context_command(self, cmd_original: str) -> None:
         """Show context window usage, token count, compressions."""
-        snapshot = self._take_context_snapshot()
+        snapshot = self._get_status_bar_snapshot()
         if not snapshot:
             _cprint(f"  ⚠ No agent context available")
             return
 
         ctx_tokens = snapshot.get("context_tokens", 0)
         ctx_length = snapshot.get("context_length", 0)
-        ctx_pct = snapshot.get("context_percent", 0)
+        ctx_pct = snapshot.get("context_percent") or 0
         compressions = snapshot.get("compressions", 0)
         session_tokens = snapshot.get("session_total_tokens", 0)
         api_calls = snapshot.get("session_api_calls", 0)
