@@ -296,6 +296,19 @@ class TestStripThinkBlocks:
         assert "line1" not in result
         assert "visible" in result
 
+    def test_boxed_reasoning_block_removed(self, agent):
+        text = (
+            "before\n"
+            "┌─ Reasoning ──────────────────────────────┐\n"
+            "┊ private reasoning                     ┊\n"
+            "└─────────────────────────────────────────┘\n"
+            "visible answer"
+        )
+        result = agent._strip_think_blocks(text)
+        assert "private reasoning" not in result
+        assert "before" in result
+        assert "visible answer" in result
+
     def test_orphaned_closing_think_tag(self, agent):
         result = agent._strip_think_blocks("some reasoning</think>actual answer")
         assert "</think>" not in result

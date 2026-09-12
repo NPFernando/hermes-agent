@@ -511,6 +511,15 @@ def strip_think_blocks(agent, content: str) -> str:
         content,
         flags=re.DOTALL | re.IGNORECASE,
     )
+    # 1b. Box-drawn reasoning block (deepseek, nemotron, etc.):
+    #     ┌─ Reasoning ──────────────────────────────┐
+    #     ┊ content                                  ┊
+    #     └───────────────────────────────────────────┘
+    content = re.sub(
+        r"(?m)^┌─ Reasoning .*\n(?:.*\n)*?^└─.*$\n*",
+        "",
+        content,
+    )
     # 2. Unterminated reasoning block — open tag at a block boundary
     #    (start of text, or after a newline) with no matching close.
     #    Strip from the tag to end of string.  Fixes #8878 / #9568
