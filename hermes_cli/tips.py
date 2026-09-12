@@ -475,6 +475,10 @@ TIPS = [
     'Dashboard plugins are served from /dashboard-plugins/<name>/ — drop files into ~/.hermes/dashboard-plugins/.',
 ]
 
+# Add the newer CLI discovery tips without discarding the established public corpus.
+TIPS = list(dict.fromkeys([*TIPS, *["Use /plan <goal> to create a structured plan before complex tasks — like Codex's /plan.","Use /review <path> to review code for quality, bugs, and improvements.","Use /commit to generate a commit message from your staged changes.","Use /explain <query> to understand code, files, or concepts in detail.","Use /search <query> to find past conversations and knowledge.","Use /summarize <path> to condense a file or conversation.","Use /check <path> to run linting and type checking on your project.","Use /init <name> to initialize project context files (AGENTS.md, CLAUDE.md).","Use /cost to see your token usage and spending breakdown.","Use /suggest to get proactive recommendations based on your context.","Use /insights to see usage analytics and trends.","Use /onboard to start an interactive tour of CLI features.","Use /model <name> to switch models mid-session.","Use /skin <name> to change the CLI theme (try /skin ares or /skin mono).","Use /background <prompt> to run a task without blocking your session.","Use /branch <name> to explore an alternative conversation path.","Use /undo to backtrack N turns and re-prompt.","Use /compress to condense your conversation context.","Use /goal <text> to set a standing goal Hermes works on across turns.","Use /voice on to switch to voice interaction mode.","Use /reasoning <level> to control how much the model 'thinks' before answering.","Use /yolo to skip dangerous command approvals (use with caution).","Use /status to see session info, model, and active tools.","Use /history to see your conversation history.","Use /save to save the current conversation.","Use /retry to re-send the last message to the agent.","Use /copy to copy the last assistant response to clipboard.","Use /image <path> to attach an image to your next prompt.","Use /cron to manage scheduled tasks.","Use /kanban to manage the multi-agent collaboration board.","Use /skills to search, install, and manage skills.","Use /curator to manage background skill maintenance.","Use /insights to see usage analytics and trends.","Use /diff [path] to show git diff — like Codex's /diff.","Use /log [N] to show git log with graph — like Codex's /log.","Use /blame <file> to show git blame annotations.","Use /gst to show git working tree status quickly.","Use /git-status to see your working tree status.","Use /onboard to explore all features with an interactive tour.","Use /cost to track your OpenRouter spending and daily caps.","Use /suggest for proactive recommendations tailored to your work.","Use /plan before starting a complex task to organize your approach.","Use /review to catch bugs before committing code.","Use /explain to understand unfamiliar code in your project.","Use /search to find past conversations about specific topics.","Use /summarize to get a quick overview of long files or docs.","Type /help to see all available commands organized by category.","Press Ctrl+L to redraw the screen if the terminal gets garbled.","Press Ctrl+G to open the draft editor for multi-line prompts.","Use /model --global to persist your model choice across sessions.","Use /project to see detected project info, test/build commands, and framework.","Hermes auto-detects your project on session start — type /project for details.","Use /edit <file> to read a file and get AI-suggested improvements.","Use /e <file> quick alias for /edit to speed up your edit workflow."]]))
+
+
 
 def get_random_tip(exclude_recent: int = 0) -> str:
     """Return a random tip string.
@@ -484,3 +488,22 @@ def get_random_tip(exclude_recent: int = 0) -> str:
             deduplication across sessions.
     """
     return random.choice(TIPS)
+
+
+def get_tips_for_area(area: str) -> list[str]:
+    """Get tips related to a specific area."""
+    area = area.lower()
+    topic_map = {
+        "code": ["review", "commit", "explain", "check"],
+        "plan": ["plan", "goal", "branch"],
+        "search": ["search", "find", "summarize"],
+        "cost": ["cost", "spend", "insights"],
+        "config": ["model", "skin", "reasoning", "voice"],
+        "help": ["help", "onboard", "suggest"],
+        "all": [],
+    }
+    keywords = topic_map.get(area, [])
+    if not keywords:
+        return [get_random_tip()]
+    matching = [t for t in TIPS if any(k in t.lower() for k in keywords)]
+    return matching[:3] if matching else [get_random_tip()]

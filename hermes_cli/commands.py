@@ -225,6 +225,58 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("version", "Show Hermes Agent version", "Info", aliases=("v",)),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
 
+    # Modern AI CLI features (Codex, Claude Code, Copilot parity)
+    CommandDef("plan", "Create a structured plan before executing complex tasks", "Session",
+               cli_only=True, args_hint="[goal | file]"),
+    CommandDef("review", "Review code changes, PRs, or files for quality and issues", "Session",
+               cli_only=True, aliases=("code-review",), args_hint="[path | diff | pr]"),
+    CommandDef("commit", "Generate a commit message from staged changes", "Session",
+               cli_only=True, args_hint="[message]"),
+    CommandDef("init", "Initialize project context files (AGENTS.md, CLAUDE.md)", "Session",
+               cli_only=True, args_hint="[project-name]"),
+    CommandDef("check", "Run linting, type checking, and static analysis", "Session",
+               cli_only=True, aliases=("lint",), args_hint="[path]"),
+    CommandDef("explain", "Explain code, files, or concepts in detail", "Session",
+               cli_only=True, aliases=("why",), args_hint="<path|query>"),
+    CommandDef("summarize", "Summarize the current conversation, a file, or a session", "Session",
+               cli_only=True, aliases=("summary",), args_hint="[path | session-id]"),
+    CommandDef("search", "Search past conversations, sessions, and knowledge", "Session",
+               cli_only=True, aliases=("find",), args_hint="<query>"),
+    CommandDef("cost", "Show current-session token usage and estimated cost", "Info",
+               cli_only=True, aliases=("pricing", "spend")),
+    CommandDef("suggest", "Get proactive suggestions based on current context", "Info",
+               cli_only=True, aliases=("ideas", "recommend"), args_hint="[area]"),
+    CommandDef("onboard", "Interactive onboarding tour of CLI features", "Info",
+               cli_only=True, args_hint="[step]"),
+
+    # Git integration (Codex, Claude Code parity)
+    CommandDef("diff", "Show git diff with optional file filter", "Session",
+               cli_only=True, aliases=("gd",), args_hint="[path]"),
+    CommandDef("log", "Show git log with optional limit", "Session",
+               cli_only=True, aliases=("git-log",), args_hint="[N]"),
+    CommandDef("blame", "Show git blame for a file", "Session",
+               cli_only=True, args_hint="<path>"),
+    CommandDef("git-status", "Show git working tree status", "Session",
+               cli_only=True, aliases=("gst",), args_hint="[path]"),
+
+    # Project intelligence
+    CommandDef("project", "Show detected project info and commands", "Info",
+               cli_only=True, aliases=("proj",), args_hint="[path]"),
+
+    # Session management
+    CommandDef("session", "Manage sessions: rename, delete, search, info", "Session",
+               cli_only=True,
+               args_hint="<subcommand> [args]",
+               subcommands=("rename", "delete", "search", "info", "list")),
+
+    # Context window & usage
+    CommandDef("context", "Show context window usage, token count, compressions", "Info",
+               cli_only=True, aliases=("ctx",), args_hint="[refresh]"),
+
+    # Code edit mode (Codex parity)
+    CommandDef("edit", "Read, suggest improvements, and apply changes to a file", "Session",
+               cli_only=True, aliases=("e",), args_hint="<path> [description]"),
+
     # Exit
     CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",
                cli_only=True, aliases=("exit",), args_hint="[--delete]"),
