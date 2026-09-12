@@ -1580,6 +1580,10 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
         cits = part.get("citations")
         if isinstance(cits, list) and cits:
             block["citations"] = cits
+    elif ptype in {"server_tool_use", "advisor_tool_result"}:
+        block = _sanitize_replay_block(part)
+        if block is None:
+            return None
     elif ptype in {"image_url", "input_image"}:
         image_value = part.get("image_url", {})
         url = image_value.get("url", "") if isinstance(image_value, dict) else str(image_value or "")
@@ -1738,6 +1742,44 @@ def _sanitize_replay_block(b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if isinstance(b.get("cache_control"), dict):
             out["cache_control"] = b["cache_control"]
         return out
+    if btype == "server_tool_use":
+        out = {
+            "type": "server_tool_use",
+            "id": _sanitize_tool_id(b.get("id", "")),
+            "name": b.get("name", ""),
+            "input": b.get("input", {}),
+        }
+        caller = b.get("caller")
+        if isinstance(caller, dict) and caller.get("type") == "direct":
+            out["caller"] = {"type": "direct"}
+        elif (
+            isinstance(caller, dict)
+            and caller.get("type") in {"code_execution_20250825", "code_execution_20260120"}
+            and isinstance(caller.get("tool_id"), str)
+            and caller.get("tool_id")
+        ):
+            out["caller"] = {
+                "type": caller["type"],
+                "tool_id": _sanitize_tool_id(caller["tool_id"]),
+            }
+        if isinstance(b.get("cache_control"), dict):
+            out["cache_control"] = b["cache_control"]
+        return out
+    if btype == "advisor_tool_result":
+        content = b.get("content")
+        if not isinstance(content, dict) or content.get("type") not in {
+            "advisor_result",
+            "advisor_redacted_result",
+            "advisor_tool_result_error",
+        }:
+            return None
+        return {
+            "type": "advisor_tool_result",
+            "tool_use_id": _sanitize_tool_id(b.get("tool_use_id", "")),
+            # Advisor content may contain an opaque encrypted result; round-trip
+            # the provider payload as-is, as required by the Messages API.
+            "content": content,
+        }
     if btype == "image":
         src = b.get("source")
         return {"type": "image", "source": src} if isinstance(src, dict) else None
@@ -1944,19 +1986,37 @@ def _strip_orphaned_tool_blocks(result: List[Dict[str, Any]]) -> None:
 
     Mutates ``result`` in place.
     """
-    # Strip orphaned tool_use blocks (no matching tool_result follows)
+    # Collect both sides before filtering. Advisor results are part of the
+    # assistant response itself (unlike client tool_result blocks, which arrive
+    # in a user message).
     tool_result_ids = set()
+    server_tool_use_ids = set()
+    advisor_tool_result_ids = set()
     for m in result:
-        if m["role"] == "user" and isinstance(m["content"], list):
+        if m["role"] in {"assistant", "user"} and isinstance(m["content"], list):
             for block in m["content"]:
-                if block.get("type") == "tool_result":
+                if m["role"] == "user" and block.get("type") == "tool_result":
                     tool_result_ids.add(block.get("tool_use_id"))
+                elif m["role"] == "assistant" and block.get("type") == "server_tool_use":
+                    server_tool_use_ids.add(block.get("id"))
+                elif m["role"] == "assistant" and block.get("type") == "advisor_tool_result":
+                    advisor_tool_result_ids.add(block.get("tool_use_id"))
     for m in result:
         if m["role"] == "assistant" and isinstance(m["content"], list):
             kept = [
                 b
                 for b in m["content"]
-                if b.get("type") != "tool_use" or b.get("id") in tool_result_ids
+                if (
+                    (b.get("type") != "tool_use" or b.get("id") in tool_result_ids)
+                    and (
+                        b.get("type") != "server_tool_use"
+                        or b.get("id") in advisor_tool_result_ids
+                    )
+                    and (
+                        b.get("type") != "advisor_tool_result"
+                        or b.get("tool_use_id") in server_tool_use_ids
+                    )
+                )
             ]
             # If stripping an orphaned tool_use mutated a turn that also carries a
             # signed thinking block, that block's Anthropic signature was computed

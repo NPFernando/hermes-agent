@@ -58,7 +58,7 @@ class TestSanitizeReplayBlock:
         assert out["citations"] == real
 
     def test_unknown_type_dropped(self):
-        assert _sanitize_replay_block({"type": "server_tool_use", "foo": 1}) is None
+        assert _sanitize_replay_block({"type": "unexpected_type", "foo": 1}) is None
 
 
 class TestContentPartConversion:
