@@ -43,6 +43,18 @@ def _completions(completer: SlashCommandCompleter, text: str):
 # ---------------------------------------------------------------------------
 
 class TestCommandRegistry:
+    def test_modern_cli_commands_are_not_published_to_gateway_menus(self):
+        cli_only_names = (
+            "plan", "review", "commit", "init", "check", "explain", "summarize",
+            "search", "cost", "suggest", "onboard", "diff", "log", "blame",
+            "git-status", "project", "session", "context", "edit",
+        )
+        for name in cli_only_names:
+            command = resolve_command(name)
+            assert command is not None and command.cli_only
+            assert f"/{name}" in COMMANDS
+            assert name not in GATEWAY_KNOWN_COMMANDS
+
     def test_registry_is_nonempty(self):
         assert len(COMMAND_REGISTRY) > 30
 

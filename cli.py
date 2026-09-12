@@ -5519,6 +5519,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             f"Tokens: {total_tokens:,}",
             f"Agent Running: {'Yes' if is_running else 'No'}",
         ])
+        # Add context info bar if available
+        snapshot = self._take_context_snapshot()
+        if snapshot:
+            ctx_pct = snapshot.get("context_percent")
+            if ctx_pct is not None:
+                bar_len = 12
+                filled = max(1, round(ctx_pct / 100 * bar_len))
+                bar = chr(0x2588) * filled + chr(0x2591) * (bar_len - filled)
+                lines.insert(-2, f"Context: [{bar}] {ctx_pct}% ({snapshot.get('context_tokens', 0):,} / {snapshot.get('context_length', 0):,})")
         self._console_print("\n".join(lines), highlight=False, markup=False)
     
     def _fast_command_available(self) -> bool:
@@ -5590,6 +5599,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
         _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
         _cprint(f"  {_DIM}Draft editor: Ctrl+G (Alt+G in VSCode/Cursor){_RST}")
+        _cprint(f"  {_BOLD}✨ Modern Features{_RST} {_DIM}(new in this update):{_RST}")
+        _cprint(f"  {_DIM}   /plan, /review, /commit, /init, /check, /explain{_RST}")
+        _cprint(f"  {_DIM}   /summarize, /search, /cost, /suggest, /onboard{_RST}")
+        _cprint(f"  {_DIM}   /project, /diff, /log, /blame, /gst{_RST}")
+        _cprint(f"  {_DIM}   /edit, /context, /session{_RST}")
         if _is_termux_environment():
             _cprint(f"  {_DIM}Attach image: /image {_termux_example_image_path()} or start your prompt with a local image path{_RST}\n")
         else:
@@ -7290,6 +7304,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
                 except Exception:
                     pass
+            # Auto-detect project (both TUI and non-TUI paths)
+            try:
+                self._auto_detect_project()
+            except Exception:
+                pass
         elif canonical == "history":
             self.show_history()
         elif canonical == "title":
@@ -7453,6 +7472,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             from hermes_cli.main import _print_version_info
 
             _print_version_info(check_updates=True)
+        elif canonical == "plan":
+            self._handle_plan_command(cmd_original)
+        elif canonical == "review":
+            self._handle_review_command(cmd_original)
+        elif canonical == "commit":
+            self._handle_commit_command(cmd_original)
+        elif canonical == "init":
+            self._handle_init_command(cmd_original)
+        elif canonical == "check":
+            self._handle_check_command(cmd_original)
+        elif canonical == "explain":
+            self._handle_explain_command(cmd_original)
+        elif canonical == "summarize":
+            self._handle_summarize_command(cmd_original)
+        elif canonical == "search":
+            self._handle_search_command(cmd_original)
+        elif canonical == "cost":
+            self._handle_cost_command(cmd_original)
+        elif canonical == "suggest":
+            self._handle_suggest_command(cmd_original)
+        elif canonical == "onboard":
+            self._handle_onboard_command(cmd_original)
+        elif canonical == "diff":
+            self._handle_diff_command(cmd_original)
+        elif canonical == "log":
+            self._handle_log_command(cmd_original)
+        elif canonical == "blame":
+            self._handle_blame_command(cmd_original)
+        elif canonical == "git-status":
+            self._handle_git_status_command(cmd_original)
+        elif canonical == "project":
+            self._handle_project_command(cmd_original)
+        elif canonical == "session":
+            self._handle_session_command(cmd_original)
+        elif canonical == "context":
+            self._handle_context_command(cmd_original)
+        elif canonical == "edit":
+            self._handle_edit_command(cmd_original)
         elif canonical == "paste":
             self._handle_paste_command()
         elif canonical == "image":
@@ -9548,6 +9605,628 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "always": "always_approve",
             "deny": "deny",
         }.get(verdict, "deny")
+
+    # ── Modern CLI command handlers (Codex / Claude Code / Copilot parity) ──
+
+    def _handle_plan_command(self, cmd_original: str) -> None:
+        """Create a structured plan before executing complex tasks."""
+        parts = cmd_original.split(maxsplit=1)
+        goal = parts[1].strip() if len(parts) > 1 else ""
+        if goal:
+            # Write plan to .hermes/plans/ and open it
+            plan_dir = os.path.join(os.path.expanduser("~"), ".hermes", "plans")
+            os.makedirs(plan_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            plan_path = os.path.join(plan_dir, f"plan-{ts}.md")
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write(f"# Plan: {goal}\n\n## Goal\n{goal}\n\n## Steps\n1. \n2. \n3. \n\n## Verification\n- \n")
+            _cprint(f"  📋 Plan created: {plan_path}")
+            _cprint(f"  💡 Edit the file, then use /goal to start working on it")
+        else:
+            _cprint(f"  📋 /plan <goal> — Create a structured plan")
+            _cprint(f"     Example: /plan refactor the auth module to use OAuth2")
+            _cprint(f"     Creates a markdown plan file in ~/.hermes/plans/")
+
+    def _handle_review_command(self, cmd_original: str) -> None:
+        """Review code changes, PRs, or files."""
+        parts = cmd_original.split(maxsplit=1)
+        target = parts[1].strip() if len(parts) > 1 else ""
+        if target:
+            _cprint(f"  🔍 Reviewing: {target}")
+            _cprint(f"  💡 Submitting to agent...")
+            self.chat(f"Review the following for code quality, bugs, and improvements: {target}")
+        else:
+            _cprint(f"  🔍 /review <path|diff|pr> — Review code for quality and issues")
+            _cprint(f"     Example: /review src/auth.py")
+            _cprint(f"     Example: /review pr #42")
+
+    def _handle_commit_command(self, cmd_original: str) -> None:
+        """Generate a commit message from staged changes."""
+        parts = cmd_original.split(maxsplit=1)
+        hint = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            import subprocess
+            diff = subprocess.run(
+                ["git", "diff", "--cached"],
+                capture_output=True, text=True, timeout=10
+            )
+            if not diff.stdout.strip():
+                # Try unstaged diff
+                diff = subprocess.run(
+                    ["git", "diff"],
+                    capture_output=True, text=True, timeout=10
+                )
+            if diff.stdout.strip():
+                preview = diff.stdout[:500]
+                _cprint(f"  📝 Generating commit message from changes...")
+                _cprint(f"  Diff preview ({len(diff.stdout)} chars):")
+                for line in preview.splitlines()[:15]:
+                    _cprint(f"    {line}")
+                if hint:
+                    _cprint(f"  Hint: {hint}")
+                _cprint(f"  💡 Submit as a prompt: 'Generate a commit message for these changes'")
+                self.chat(
+                    f"Generate a concise, descriptive commit message for the following changes. "
+                    f"Use conventional commits format (feat:, fix:, chore:, etc.).\n\n"
+                    f"```diff\n{diff.stdout[:2000]}\n```\n\n"
+                    f"{'Additional context: ' + hint if hint else ''}"
+                )
+            else:
+                _cprint(f"  ⚠ No changes detected. Stage files first with `git add`")
+        except Exception as e:
+            _cprint(f"  ⚠ Error: {e}")
+
+    def _handle_init_command(self, cmd_original: str) -> None:
+        """Initialize project context files (AGENTS.md, CLAUDE.md)."""
+        parts = cmd_original.split(maxsplit=1)
+        project_name = parts[1].strip() if len(parts) > 1 else os.path.basename(os.getcwd())
+        cwd = os.getcwd()
+        agents_path = os.path.join(cwd, "AGENTS.md")
+        claude_path = os.path.join(cwd, "CLAUDE.md")
+        if os.path.exists(agents_path) or os.path.exists(claude_path):
+            _cprint(f"  ⚠ Context files already exist in {cwd}")
+            _cprint(f"  💡 Use /init to overwrite (not implemented yet)")
+            return
+        for path, content in [
+            (agents_path, f"# {project_name}\n\n## Project Context\n\nDescribe the project, its structure, and conventions here.\n\n## Tech Stack\n\n- \n\n## Architecture\n\n-\n"),
+            (claude_path, f"# {project_name}\n\n## Instructions\n\n- Be concise and direct\n- Run lint/tests before suggesting changes\n- Follow existing code style\n\n## Commands\n\n- `npm run dev` — Start development server\n- `npm run build` — Build for production\n- `npm run test` — Run tests\n"),
+        ]:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        _cprint(f"  ✅ Project context initialized: {project_name}")
+        _cprint(f"     Created: AGENTS.md, CLAUDE.md")
+        _cprint(f"  💡 Edit these files to describe your project")
+
+    def _handle_check_command(self, cmd_original: str) -> None:
+        """Run linting, type checking, and static analysis."""
+        parts = cmd_original.split(maxsplit=1)
+        target = parts[1].strip() if len(parts) > 1 else "."
+        _cprint(f"  🔎 Running checks on: {target}")
+        try:
+            import subprocess
+            # Try TypeScript first
+            if os.path.exists(os.path.join(target, "tsconfig.json")) or os.path.exists(os.path.join(target, "package.json")):
+                result = subprocess.run(
+                    ["npx", "tsc", "--noEmit"],
+                    capture_output=True, text=True, timeout=60, cwd=target
+                )
+                if result.returncode == 0:
+                    _cprint(f"  ✅ TypeScript: no errors")
+                else:
+                    lines = result.stdout.splitlines()[:15]
+                    for line in lines:
+                        _cprint(f"  ⚠ {line}")
+                    if len(result.stdout.splitlines()) > 15:
+                        _cprint(f"  ... and {len(result.stdout.splitlines()) - 15} more")
+            # Try Python
+            if os.path.exists(os.path.join(target, "pyproject.toml")) or os.path.exists(os.path.join(target, "setup.py")):
+                result = subprocess.run(
+                    ["python3", "-m", "py_compile"] + [f for f in os.listdir(target) if f.endswith(".py")],
+                    capture_output=True, text=True, timeout=30, cwd=target
+                )
+                if result.returncode == 0:
+                    _cprint(f"  ✅ Python: syntax OK")
+        except Exception as e:
+            _cprint(f"  ⚠ Check failed: {e}")
+
+    def _handle_explain_command(self, cmd_original: str) -> None:
+        """Explain code, files, or concepts."""
+        parts = cmd_original.split(maxsplit=1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+        if query:
+            _cprint(f"  💡 Explaining: {query}")
+            self.chat(f"Explain the following in detail: {query}")
+        else:
+            _cprint(f"  💡 /explain <path|query> — Explain code, files, or concepts")
+            _cprint(f"     Example: /explain src/auth.py")
+            _cprint(f"     Example: /explain what is a closure?")
+
+    def _handle_summarize_command(self, cmd_original: str) -> None:
+        """Summarize the current conversation, a file, or a session."""
+        parts = cmd_original.split(maxsplit=1)
+        target = parts[1].strip() if len(parts) > 1 else ""
+        if target and os.path.isfile(target):
+            try:
+                with open(target, encoding="utf-8") as f:
+                    content = f.read()[:2000]
+                _cprint(f"  📄 Summarizing file: {target}")
+                self.chat(f"Summarize the following content:\n\n{content}")
+            except Exception as e:
+                _cprint(f"  ⚠ Error: {e}")
+        elif target:
+            _cprint(f"  📄 Summarizing: {target}")
+            self.chat(f"Summarize: {target}")
+        else:
+            _cprint(f"  📄 /summarize [path | session-id] — Summarize conversation or file")
+            _cprint(f"     Example: /summarize README.md")
+            _cprint(f"     Example: /summarize (summarizes current conversation)")
+
+    def _handle_search_command(self, cmd_original: str) -> None:
+        """Search past conversations, sessions, and knowledge."""
+        parts = cmd_original.split(maxsplit=1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+        if query:
+            _cprint(f"  🔍 Searching: {query}")
+            try:
+                from hermes_state import SessionDB
+                db_path = os.path.join(os.path.expanduser("~"), ".hermes", "state.db")
+                if os.path.exists(db_path):
+                    db = SessionDB(db_path)
+                    results = db.search_sessions(query, limit=5)
+                    if results:
+                        _cprint(f"  📚 Found {len(results)} session(s):")
+                        for r in results:
+                            _cprint(f"     • {r.get('title', 'Untitled')} ({r.get('session_id', '')[:8]}…)")
+                    else:
+                        _cprint(f"  No results found")
+            except Exception as e:
+                _cprint(f"  🔍 Searching via agent: {query}")
+                self.chat(f"Search my past conversations and knowledge for: {query}")
+        else:
+            _cprint(f"  🔍 /search <query> — Search past conversations and knowledge")
+            _cprint(f"     Example: /search auth refactor")
+
+    def _handle_cost_command(self, cmd_original: str) -> None:
+        """Show reliable current-session usage without inventing account totals."""
+        parts = cmd_original.split(maxsplit=1)
+        requested_range = parts[1].strip() if len(parts) > 1 else ""
+        if requested_range and requested_range.lower() not in {"session", "current"}:
+            _cprint("  Historical cost ranges are not available in this command; showing current-session usage.")
+        self._show_usage()
+
+    def _handle_suggest_command(self, cmd_original: str) -> None:
+        """Get proactive suggestions based on current context."""
+        parts = cmd_original.split(maxsplit=1)
+        area = parts[1].strip() if len(parts) > 1 else "all"
+        _cprint(f"  💡 Proactive suggestions ({area}):")
+        try:
+            from hermes_cli.tips import get_random_tip
+            _cprint(f"    • Tip: {get_random_tip()}")
+        except Exception:
+            pass
+        _cprint(f"    • Check /insights for usage analytics")
+        _cprint(f"    • Try /cost to see your spending breakdown")
+        _cprint(f"    • Use /plan before complex tasks")
+        _cprint(f"    • Run /review on your code changes")
+        _cprint(f"    • Use /search to find past conversations")
+
+    def _handle_onboard_command(self, cmd_original: str) -> None:
+        """Interactive onboarding tour of CLI features."""
+        parts = cmd_original.split(maxsplit=1)
+        step = parts[1].strip() if len(parts) > 1 else ""
+        steps = {
+            "1": ("Welcome to Hermes CLI!", "Just type your message to chat. Try saying 'hello' or ask a question."),
+            "2": ("Slash Commands", "Type / to see available commands. Try /help for a full list."),
+            "3": ("Code Features", "Use /explain to understand code, /review to check quality, /commit to generate messages."),
+            "4": ("Git Integration", "Use /diff to see changes, /log for history, /blame for annotations, /gst for status."),
+            "5": ("Planning & Goals", "Use /plan to create structured plans, /goal to execute them across turns."),
+            "6": ("Search & Knowledge", "Use /search to find past conversations. Use /summarize to condense information."),
+            "7": ("Cost & Insights", "Use /cost to track spending. Use /insights for analytics. Use /suggest for recommendations."),
+            "8": ("Configuration", "Use /model to switch models. Use /skin to change themes. Use /config to see settings."),
+        }
+        if step in steps:
+            title, text = steps[step]
+            _cprint(f"  🎓 Step {step}: {title}")
+            _cprint(f"     {text}")
+            next_step = str(int(step) + 1)
+            if next_step in steps:
+                _cprint(f"  💡 Next: /onboard {next_step}")
+        else:
+            _cprint(f"  🎓 Hermes CLI Onboarding")
+            _cprint(f"  ────────────────────────")
+            for i in range(1, len(steps) + 1):
+                t, _ = steps[str(i)]
+                _cprint(f"  {i}. {t}")
+            _cprint(f"")
+            _cprint(f"  Start: /onboard 1")
+
+    # ── Git integration handlers ──
+
+    def _handle_diff_command(self, cmd_original: str) -> None:
+        """Show git diff with optional file filter."""
+        parts = cmd_original.split(maxsplit=1)
+        path = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            import subprocess
+            cmd = ["git", "diff"]
+            if path:
+                cmd.append(path)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.stdout.strip():
+                lines = result.stdout.splitlines()
+                _cprint(f"  📊 Git diff ({len(lines)} lines):")
+                for line in lines[:30]:
+                    _cprint(f"    {line}")
+                if len(lines) > 30:
+                    _cprint(f"  … and {len(lines) - 30} more lines")
+            else:
+                _cprint(f"  No changes (working tree is clean)")
+        except FileNotFoundError:
+            _cprint(f"  ⚠ Not a git repository or git not installed")
+            self._suggest_on_error("git")
+        except Exception as e:
+            _cprint(f"  ⚠ Error: {e}")
+
+    def _handle_log_command(self, cmd_original: str) -> None:
+        """Show git log with optional limit."""
+        parts = cmd_original.split(maxsplit=1)
+        limit = parts[1].strip() if len(parts) > 1 else "10"
+        try:
+            n = min(int(limit), 50)
+        except ValueError:
+            n = 10
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "log", f"--max-count={n}", "--oneline", "--decorate", "--graph"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.stdout.strip():
+                _cprint(f"  📜 Git log (last {n} commits):")
+                for line in result.stdout.strip().splitlines():
+                    _cprint(f"    {line}")
+            else:
+                _cprint(f"  No commits found")
+        except FileNotFoundError:
+            _cprint(f"  ⚠ Not a git repository or git not installed")
+            self._suggest_on_error("git")
+        except Exception as e:
+            _cprint(f"  ⚠ Error: {e}")
+
+    def _handle_blame_command(self, cmd_original: str) -> None:
+        """Show git blame for a file."""
+        parts = cmd_original.split(maxsplit=1)
+        path = parts[1].strip() if len(parts) > 1 else ""
+        if not path:
+            _cprint(f"  🔍 /blame <file> — Show git blame for a file")
+            _cprint(f"     Example: /blame src/auth.py")
+            return
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "blame", "--date=short", path],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.stdout.strip():
+                lines = result.stdout.splitlines()
+                _cprint(f"  🔍 Git blame: {path} ({len(lines)} lines)")
+                for line in lines[:25]:
+                    _cprint(f"    {line}")
+                if len(lines) > 25:
+                    _cprint(f"  … and {len(lines) - 25} more lines")
+            else:
+                _cprint(f"  No blame info for {path}")
+        except FileNotFoundError:
+            _cprint(f"  ⚠ Not a git repository or git not installed")
+        except Exception as e:
+            _cprint(f"  ⚠ Error: {e}")
+
+    def _handle_git_status_command(self, cmd_original: str) -> None:
+        """Show git working tree status."""
+        parts = cmd_original.split(maxsplit=1)
+        path = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            import subprocess
+            cmd = ["git", "status", "--short"]
+            if path:
+                cmd.append(path)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.stdout.strip():
+                _cprint(f"  📂 Git status:")
+                for line in result.stdout.strip().splitlines():
+                    _cprint(f"    {line}")
+            else:
+                _cprint(f"  ✅ Working tree clean")
+            # Also show branch
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                capture_output=True, text=True, timeout=5
+            )
+            if branch.stdout.strip():
+                _cprint(f"  📌 Branch: {branch.stdout.strip()}")
+        except FileNotFoundError:
+            _cprint(f"  ⚠ Not a git repository or git not installed")
+            self._suggest_on_error("git")
+        except Exception as e:
+            _cprint(f"  ⚠ Error: {e}")
+
+    def _suggest_on_error(self, context: str = "") -> None:
+        """Suggest alternative commands when something fails."""
+        suggestions = {
+            "git": [
+                "Try /status to check session info instead",
+                "Use /diff to see file changes in the current directory",
+                "Use /log to see recent commit history",
+            ],
+            "file": [
+                "Use /search to find files by content",
+                "Use /explain to read a file's contents",
+                "Use /summarize to get an overview of a file",
+            ],
+            "network": [
+                "Use /status to check connection status",
+                "Try the request again with /retry",
+                "Use /model --refresh to update model availability",
+            ],
+        }
+        tips = suggestions.get(context, [])
+        if tips:
+            _cprint(f"  💡 Suggestions:")
+            for tip in tips:
+                _cprint(f"     • {tip}")
+
+    def _handle_project_command(self, cmd_original: str) -> None:
+        """Show detected project info and commands."""
+        parts = cmd_original.split(maxsplit=1)
+        path = parts[1].strip() if len(parts) > 1 else os.getcwd()
+        if not os.path.isdir(path):
+            _cprint(f"  ⚠ Directory not found: {path}")
+            return
+        try:
+            from hermes_cli.project_detect import detect_project
+
+            project = detect_project(path)
+            if project:
+                _cprint(f"  {format_project_summary(project)}")
+            else:
+                _cprint(f"  📁 No project detected in {path}")
+                _cprint(f"  💡 Use /init to create project context files")
+        except Exception as e:
+            _cprint(f"  ⚠ Error: {e}")
+
+    def _handle_session_command(self, cmd_original: str) -> None:
+        """Manage sessions: rename, delete, search, info, list."""
+        rest = cmd_original.split(maxsplit=1)
+        args = rest[1].strip() if len(rest) > 1 else ""
+        subcmd_parts = args.split(maxsplit=1)
+        subcmd = subcmd_parts[0].lower() if subcmd_parts else ""
+        subargs = subcmd_parts[1].strip() if len(subcmd_parts) > 1 else ""
+
+        if not subcmd:
+            _cprint(f"  📋 /session <subcommand> [args]")
+            _cprint(f"     Subcommands: rename, delete, search, info, list")
+            _cprint(f"     Examples:")
+            _cprint(f"       /session rename my-project-refactor")
+            _cprint(f"       /session delete <session-id>")
+            _cprint(f"       /session search auth refactor")
+            _cprint(f"       /session info")
+            _cprint(f"       /session list")
+            return
+
+        if not self._session_db:
+            _cprint(f"  ⚠ Session database not available")
+            return
+
+        if subcmd == "rename":
+            if not subargs:
+                _cprint(f"  ⚠ Usage: /session rename <title>")
+                return
+            try:
+                from hermes_state import SessionDB
+                new_title = SessionDB.sanitize_title(subargs)
+                if not new_title:
+                    _cprint(f"  ⚠ Title is empty after cleanup. Use printable characters.")
+                    return
+                if self._session_db.set_session_title(self.session_id, new_title):
+                    _cprint(f"  ✅ Session renamed to: {new_title}")
+                else:
+                    _cprint(f"  ⚠ Failed to rename session")
+            except ValueError as e:
+                _cprint(f"  ⚠ {e}")
+
+        elif subcmd == "delete":
+            target_id = subargs.strip() if subargs else self.session_id
+            if target_id == self.session_id:
+                _cprint(f"  ⚠ To delete the current session, use /quit --delete")
+                _cprint(f"  💡 To delete another session: /session delete <session-id>")
+                return
+            try:
+                deleted = self._session_db.delete_session(target_id)
+                if deleted:
+                    _cprint(f"  ✅ Session {target_id[:12]}… deleted")
+                else:
+                    _cprint(f"  ⚠ Session not found: {target_id}")
+            except Exception as e:
+                _cprint(f"  ⚠ Error: {e}")
+
+        elif subcmd == "search":
+            if not subargs:
+                _cprint(f"  ⚠ Usage: /session search <query>")
+                return
+            try:
+                results = self._session_db.search_sessions(source=None, limit=10)
+                matches = [s for s in results if subargs.lower() in (s.get("title", "") or "").lower() or subargs.lower() in (s.get("preview", "") or "").lower()]
+                if matches:
+                    _cprint(f"  📚 Found {len(matches)} session(s):")
+                    for i, s in enumerate(matches[:10], 1):
+                        tid = s.get("id", "?")[:12]
+                        title = s.get("title") or "Untitled"
+                        preview = (s.get("preview") or "")[:40]
+                        _cprint(f"  {i:>2}. {title:<30} {preview:<42} {tid}")
+                else:
+                    _cprint(f"  No sessions match '{subargs}'")
+            except Exception as e:
+                _cprint(f"  ⚠ Error: {e}")
+
+        elif subcmd == "info":
+            target_id = subargs.strip() if subargs else self.session_id
+            try:
+                session = self._session_db.get_session(target_id)
+                if session:
+                    _cprint(f"  📋 Session Info:")
+                    _cprint(f"     ID:     {session.get('id', '?')}")
+                    _cprint(f"     Title:  {session.get('title') or 'Untitled'}")
+                    _cprint(f"     Model:  {session.get('model') or '?'}")
+                    _cprint(f"     Source: {session.get('source') or '?'}")
+                    started = session.get("started_at", "")
+                    if started:
+                        _cprint(f"     Started: {started}")
+                    ended = session.get("ended_at", "")
+                    if ended:
+                        _cprint(f"     Ended:   {ended}")
+                else:
+                    _cprint(f"  ⚠ Session not found: {target_id}")
+            except Exception as e:
+                _cprint(f"  ⚠ Error: {e}")
+
+        elif subcmd == "list":
+            try:
+                results = self._session_db.search_sessions(source=None, limit=20)
+                if results:
+                    _cprint(f"  📚 Recent sessions:")
+                    for i, s in enumerate(results[:20], 1):
+                        tid = s.get("id", "?")[:12]
+                        title = s.get("title") or "Untitled"
+                        preview = (s.get("preview") or "")[:35]
+                        active = s.get("last_active", "") or ""
+                        if active and len(active) > 10:
+                            active = active[:10]
+                        _cprint(f"  {i:>2}. {title:<28} {preview:<37} {active:<12} {tid}")
+                else:
+                    _cprint(f"  No sessions found")
+            except Exception as e:
+                _cprint(f"  ⚠ Error: {e}")
+
+        else:
+            _cprint(f"  ⚠ Unknown subcommand: {subcmd}")
+            _cprint(f"  💡 Available: rename, delete, search, info, list")
+
+    def _handle_context_command(self, cmd_original: str) -> None:
+        """Show context window usage, token count, compressions."""
+        snapshot = self._take_context_snapshot()
+        if not snapshot:
+            _cprint(f"  ⚠ No agent context available")
+            return
+
+        ctx_tokens = snapshot.get("context_tokens", 0)
+        ctx_length = snapshot.get("context_length", 0)
+        ctx_pct = snapshot.get("context_percent", 0)
+        compressions = snapshot.get("compressions", 0)
+        session_tokens = snapshot.get("session_total_tokens", 0)
+        api_calls = snapshot.get("session_api_calls", 0)
+
+        _cprint(f"  Context Window")
+        _cprint(f"  ")
+
+        if ctx_length:
+            bar_len = 20
+            filled = max(1, round(ctx_pct / 100 * bar_len))
+            bar = chr(0x2588) * filled + chr(0x2591) * (bar_len - filled)
+            _cprint(f"     [{bar}] {ctx_pct}%")
+            _cprint(f"     {ctx_tokens:,} / {ctx_length:,} tokens ({ctx_pct}%)")
+        else:
+            _cprint(f"     Context window info not available yet")
+
+        _cprint(f"     Compressions: {compressions}")
+        _cprint(f"     Session tokens: {session_tokens:,}")
+        _cprint(f"     API calls: {api_calls}")
+
+        if ctx_pct > 80:
+            _cprint(f"  Context nearly full - use /compress to free space")
+        elif ctx_pct > 50:
+            _cprint(f"  Consider /compress if performance degrades")
+
+    def _handle_edit_command(self, cmd_original: str) -> None:
+        """Read, suggest improvements, and apply changes to a file (Codex edit mode)."""
+        parts = cmd_original.split(maxsplit=1)
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        args_parts = rest.split(maxsplit=1)
+        filepath = args_parts[0] if args_parts else ""
+        description = args_parts[1].strip() if len(args_parts) > 1 else ""
+
+        if not filepath:
+            _cprint(f"  📝 /edit <path> [description] — Edit a file with AI assistance")
+            _cprint(f"     Example: /edit src/auth.py add input validation")
+            _cprint(f"     Example: /edit README.md update API documentation")
+            return
+
+        path = os.path.abspath(os.path.expanduser(filepath))
+        if not os.path.isfile(path):
+            _cprint(f"  ⚠ File not found: {path}")
+            _cprint(f"  💡 Use absolute path or relative to current directory")
+            return
+
+        # Read the file
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            _cprint(f"  ⚠ Error reading file: {e}")
+            return
+
+        # Get file info
+        ext = os.path.splitext(path)[1]
+        lines = content.splitlines()
+        line_count = len(lines)
+        size_kb = round(os.path.getsize(path) / 1024, 1)
+
+        # Show file context
+        _cprint(f"  📝 Editing: {path}")
+        _cprint(f"     {line_count} lines, {size_kb} KB ({ext})")
+
+        # Show a preview of the file
+        preview_lines = lines[:15]
+        _cprint(f"  ── Current content (first {len(preview_lines)} lines) ──")
+        for i, line in enumerate(preview_lines, 1):
+            _cprint(f"  {i:>4}| {line[:80]}")
+        if line_count > 15:
+            _cprint(f"  … ({line_count - 15} more lines)")
+
+        # Build the prompt
+        prompt = f"Edit the file `{path}`. "
+        if description:
+            prompt += f"The user wants: {description}. "
+        else:
+            prompt += f"Review the file for improvements, bugs, or style issues and suggest concrete changes. "
+        prompt += f"\n\nFile content:\n```{ext[1:]}\n{content[:3000]}\n```"
+
+        _cprint(f"  💡 Sending to agent for review...")
+        self.chat(prompt)
+
+        # Show tips for applying changes
+        _cprint(f"  💡 To apply suggested changes:")
+        _cprint(f"     • Use /patch to apply targeted edits")
+        _cprint(f"     • Use /write_file to rewrite the entire file")
+        _cprint(f"     • Use /check to verify syntax after editing")
+
+    def _auto_detect_project(self) -> None:
+        """Auto-detect project on session start and show a brief message."""
+        try:
+            from hermes_cli.project_detect import detect_project, format_project_summary
+
+            project = detect_project()
+            if project:
+                ptype = project.get("type", "project")
+                pname = project.get("name", "")
+                framework = project.get("framework", "")
+                summary = f"  📁 {pname} ({ptype}"
+                if framework:
+                    summary += f", {framework}"
+                summary += ")"
+                _cprint(f"  {summary}")
+                _cprint(f"  💡 Use /project to see commands, /init to add context files")
+        except Exception:
+            pass
 
     def _handle_approval_selection(self) -> None:
         """Process the currently selected dangerous-command approval choice."""
