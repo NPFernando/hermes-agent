@@ -9769,17 +9769,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if query:
             _cprint(f"  🔍 Searching: {query}")
             try:
-                from hermes_state import SessionDB
-                db_path = os.path.join(os.path.expanduser("~"), ".hermes", "state.db")
-                if os.path.exists(db_path):
-                    db = SessionDB(db_path)
-                    results = db.search_sessions(query, limit=5)
+                db = getattr(self, "_session_db", None)
+                if db is not None:
+                    results = db.search_messages(query, limit=5)
                     if results:
-                        _cprint(f"  📚 Found {len(results)} session(s):")
-                        for r in results:
-                            _cprint(f"     • {r.get('title', 'Untitled')} ({r.get('session_id', '')[:8]}…)")
+                        _cprint(f"  📚 Found {len(results)} matching message(s):")
+                        for result in results:
+                            session_id = str(result.get("session_id", ""))
+                            snippet = " ".join(str(result.get("snippet", "")).split())
+                            source = result.get("source") or "conversation"
+                            _cprint(
+                                f"     • [{source}] {result.get('role', 'message')}: "
+                                f"{snippet[:180]} ({session_id[:8]}…)"
+                            )
                     else:
-                        _cprint(f"  No results found")
+                        _cprint("  No results found")
+                else:
+                    _cprint("  Past-conversation search is unavailable in this session")
             except Exception as e:
                 _cprint(f"  🔍 Searching via agent: {query}")
                 self.chat(f"Search my past conversations and knowledge for: {query}")
@@ -9851,7 +9857,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             import subprocess
             cmd = ["git", "diff"]
             if path:
-                cmd.append(path)
+                cmd.extend(["--", path])
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if result.stdout.strip():
                 lines = result.stdout.splitlines()
@@ -9876,6 +9882,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             n = min(int(limit), 50)
         except ValueError:
             n = 10
+        n = max(n, 1)
         try:
             import subprocess
             result = subprocess.run(
@@ -9905,7 +9912,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         try:
             import subprocess
             result = subprocess.run(
-                ["git", "blame", "--date=short", path],
+                ["git", "blame", "--date=short", "--", path],
                 capture_output=True, text=True, timeout=15
             )
             if result.stdout.strip():
@@ -9930,7 +9937,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             import subprocess
             cmd = ["git", "status", "--short"]
             if path:
-                cmd.append(path)
+                cmd.extend(["--", path])
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.stdout.strip():
                 _cprint(f"  📂 Git status:")

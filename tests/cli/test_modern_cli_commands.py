@@ -32,3 +32,63 @@ def test_project_command_formats_a_detected_project(monkeypatch):
     HermesCLI._handle_project_command(SimpleNamespace(), "/project")
 
     assert "demo (node)" in "\n".join(printed)
+
+
+def test_search_command_uses_message_search_from_current_session_db(monkeypatch):
+    db = SimpleNamespace(
+        search_messages=Mock(
+            return_value=[
+                {
+                    "session_id": "12345678-abcd",
+                    "role": "user",
+                    "source": "cli",
+                    "snippet": "found matching text",
+                }
+            ]
+        )
+    )
+    printed = []
+    monkeypatch.setattr("cli._cprint", lambda message, **kwargs: printed.append(str(message)))
+
+    HermesCLI._handle_search_command(SimpleNamespace(_session_db=db), "/search matching text")
+
+    db.search_messages.assert_called_once_with("matching text", limit=5)
+    assert "found matching text" in "\n".join(printed)
+
+
+def test_git_commands_treat_user_path_as_pathspec_after_option_separator(monkeypatch):
+    import subprocess
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("cli._cprint", lambda message, **kwargs: None)
+
+    HermesCLI._handle_diff_command(SimpleNamespace(), "/diff --output=/tmp/unexpected")
+    HermesCLI._handle_blame_command(SimpleNamespace(), "/blame --reverse")
+    HermesCLI._handle_git_status_command(SimpleNamespace(), "/git-status --porcelain=v1")
+
+    assert calls[0] == ["git", "diff", "--", "--output=/tmp/unexpected"]
+    assert calls[1] == ["git", "blame", "--date=short", "--", "--reverse"]
+    assert calls[2] == ["git", "status", "--short", "--", "--porcelain=v1"]
+
+
+def test_log_command_clamps_nonpositive_limit(monkeypatch):
+    import subprocess
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("cli._cprint", lambda message, **kwargs: None)
+
+    HermesCLI._handle_log_command(SimpleNamespace(), "/log -10")
+
+    assert calls[0][2] == "--max-count=1"
