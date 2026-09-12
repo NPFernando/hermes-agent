@@ -9984,7 +9984,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"  ⚠ Directory not found: {path}")
             return
         try:
-            from hermes_cli.project_detect import detect_project
+            from hermes_cli.project_detect import detect_project, format_project_summary
 
             project = detect_project(path)
             if project:
@@ -10213,7 +10213,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
     def _auto_detect_project(self) -> None:
         """Auto-detect project on session start and show a brief message."""
         try:
-            from hermes_cli.project_detect import detect_project, format_project_summary
+            from hermes_cli.project_detect import detect_project
 
             project = detect_project()
             if project:
