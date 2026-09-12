@@ -10079,15 +10079,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint(f"  ⚠ Usage: /session search <query>")
                 return
             try:
-                results = self._session_db.search_sessions(source=None, limit=10)
-                matches = [s for s in results if subargs.lower() in (s.get("title", "") or "").lower() or subargs.lower() in (s.get("preview", "") or "").lower()]
+                matches = {}
+                for session in self._session_db.search_sessions(source=None, limit=50):
+                    title = session.get("title") or "Untitled"
+                    preview = session.get("preview") or ""
+                    if subargs.lower() in title.lower() or subargs.lower() in preview.lower():
+                        matches[session.get("id", "?")] = {
+                            "title": title,
+                            "preview": preview,
+                        }
+                for message in self._session_db.search_messages(subargs, limit=10):
+                    session_id = message.get("session_id", "?")
+                    entry = matches.setdefault(
+                        session_id,
+                        {"title": "Message match", "preview": ""},
+                    )
+                    if message.get("snippet"):
+                        entry["preview"] = message["snippet"]
                 if matches:
-                    _cprint(f"  📚 Found {len(matches)} session(s):")
-                    for i, s in enumerate(matches[:10], 1):
-                        tid = s.get("id", "?")[:12]
-                        title = s.get("title") or "Untitled"
-                        preview = (s.get("preview") or "")[:40]
-                        _cprint(f"  {i:>2}. {title:<30} {preview:<42} {tid}")
+                    _cprint(f"  📚 Found {len(matches)} matching session(s):")
+                    for i, (session_id, session) in enumerate(list(matches.items())[:10], 1):
+                        title = session["title"]
+                        preview = " ".join(str(session["preview"]).split())[:80]
+                        _cprint(f"  {i:>2}. {title:<30} {preview:<82} {str(session_id)[:12]}")
                 else:
                     _cprint(f"  No sessions match '{subargs}'")
             except Exception as e:

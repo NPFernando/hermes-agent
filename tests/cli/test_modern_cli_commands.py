@@ -56,6 +56,29 @@ def test_search_command_uses_message_search_from_current_session_db(monkeypatch)
     assert "found matching text" in "\n".join(printed)
 
 
+def test_session_search_includes_full_text_message_matches(monkeypatch):
+    db = SimpleNamespace(
+        search_sessions=Mock(return_value=[]),
+        search_messages=Mock(
+            return_value=[
+                {
+                    "session_id": "abcdef0123456789",
+                    "snippet": "the matching message body",
+                }
+            ]
+        ),
+    )
+    printed = []
+    monkeypatch.setattr("cli._cprint", lambda message, **kwargs: printed.append(str(message)))
+
+    HermesCLI._handle_session_command(
+        SimpleNamespace(_session_db=db), "/session search matching"
+    )
+
+    db.search_messages.assert_called_once_with("matching", limit=10)
+    assert "the matching message body" in "\n".join(printed)
+
+
 def test_git_commands_treat_user_path_as_pathspec_after_option_separator(monkeypatch):
     import subprocess
 
