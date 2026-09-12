@@ -25,6 +25,8 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import hashlib
+import hmac
 import dataclasses
 import inspect
 import json
@@ -39,11 +41,13 @@ import tempfile
 import threading
 import time
 import sqlite3
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List, Union
+import httpx
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1279,7 +1283,7 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(*, requested_provider: str | None = None) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
     Provider is read from ``config.yaml`` ``model.provider`` (the single
@@ -1300,7 +1304,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
-        runtime = resolve_runtime_provider()
+        runtime = resolve_runtime_provider(requested=requested_provider)
     except AuthError as auth_exc:
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
@@ -1971,6 +1975,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+    _harp_routing_status: Dict[str, Any] = {}
+    _harp_routing_history: list[Dict[str, Any]] = []
+    _harp_routing_alert_history: list[Dict[str, Any]] = []
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -2204,6 +2211,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
+        self._harp_routing_history = self._load_harp_routing_history()
+        self._harp_routing_alert_history = self._load_harp_routing_alert_history()
         # Recent voice transcripts per (guild,user) for duplicate suppression.
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
@@ -2306,6 +2315,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # -- Voice mode persistence ------------------------------------------
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
+    _HARP_ROUTING_STATUS_PATH = _hermes_home / "harp-routing-status.json"
 
     def _voice_key(self, platform: Platform, chat_id: str) -> str:
         """Return a platform-namespaced key for voice mode state."""
@@ -2336,6 +2346,283 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             result[key] = mode
         return result
+
+    def _load_harp_routing_history(self) -> list[Dict[str, Any]]:
+        try:
+            data = json.loads(self._HARP_ROUTING_STATUS_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        history = data.get("history")
+        if not isinstance(history, list):
+            return []
+        rows: list[Dict[str, Any]] = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "state": str(item.get("state") or ""),
+                    "decision_id": str(item.get("decision_id") or ""),
+                    "provider": str(item.get("provider") or ""),
+                    "model": str(item.get("model") or ""),
+                    "reason": str(item.get("reason") or ""),
+                    "session_key": str(item.get("session_key") or ""),
+                    "timestamp": float(item.get("timestamp") or 0.0),
+                }
+            )
+        return rows
+
+    def _load_harp_routing_alert_history(self) -> list[Dict[str, Any]]:
+        try:
+            data = json.loads(self._HARP_ROUTING_STATUS_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        alerts = data.get("alerts")
+        if not isinstance(alerts, list):
+            return []
+        rows: list[Dict[str, Any]] = []
+        for item in alerts:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "severity": str(item.get("severity") or ""),
+                    "message": str(item.get("message") or ""),
+                    "timestamp": float(item.get("timestamp") or 0.0),
+                    "audit_id": str(item.get("audit_id") or ""),
+                    "channel_deliveries": int(item.get("channel_deliveries") or 0),
+                    "webhook_status": str(item.get("webhook_status") or ""),
+                    "webhook_attempts": int(item.get("webhook_attempts") or 0),
+                    "webhook_error": str(item.get("webhook_error") or ""),
+                    "webhook_signed": bool(item.get("webhook_signed") or False),
+                }
+            )
+        return rows
+
+    def _persist_harp_routing_status(self) -> None:
+        payload = {
+            "status": getattr(self, "_harp_routing_status", {}) or {},
+            "history": list(getattr(self, "_harp_routing_history", []) or []),
+            "alerts": list(getattr(self, "_harp_routing_alert_history", []) or []),
+        }
+        atomic_json_write(self._HARP_ROUTING_STATUS_PATH, payload)
+
+    def _harp_provider_cooldown_remaining(self, provider: str, now_ts: float) -> float:
+        try:
+            cfg = _load_gateway_config()
+            harp_cfg = cfg.get("harp_routing", {})
+            if not isinstance(harp_cfg, dict):
+                return 0.0
+            base = int(harp_cfg.get("provider_cooldown_base_seconds") or 0)
+            penalties = harp_cfg.get("provider_penalties") or {}
+            decay_mode = str(harp_cfg.get("provider_penalty_decay") or "fixed").strip().lower()
+            extra = 0
+            if isinstance(penalties, dict):
+                extra = int(penalties.get(provider) or 0)
+            history = list(getattr(self, "_harp_routing_history", []) or [])
+            streak = 0
+            for item in reversed(history):
+                if item.get("state") == "failed" and str(item.get("provider") or "") == provider:
+                    streak += 1
+                elif streak > 0:
+                    break
+            if streak < 1:
+                streak = 1
+            weighted_extra = extra
+            if extra > 0:
+                if decay_mode == "linear":
+                    weighted_extra = extra * streak
+                elif decay_mode == "exponential":
+                    weighted_extra = extra * (2 ** max(0, streak - 1))
+            cooldown = max(0, base + weighted_extra)
+            if cooldown < 1:
+                return 0.0
+            provider_failures = [
+                float(item.get("timestamp") or 0.0)
+                for item in history
+                if item.get("state") == "failed" and str(item.get("provider") or "") == provider
+            ]
+            if not provider_failures:
+                return 0.0
+            last_failure = max(provider_failures)
+            remaining = (last_failure + cooldown) - now_ts
+            return remaining if remaining > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    async def _send_harp_alert(self, *, severity: str, message: str) -> None:
+        audit_id = str(uuid.uuid4())
+        channel_deliveries = 0
+        prefix = "⚠️" if severity == "warning" else "🚨"
+        text = f"{prefix} HARP routing {severity}: {message}"
+        for platform, adapter in self.adapters.items():
+            home = self.config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                continue
+            try:
+                metadata = self._thread_metadata_for_target(
+                    platform,
+                    home.chat_id,
+                    home.thread_id,
+                    adapter=adapter,
+                )
+                if metadata:
+                    await adapter.send(str(home.chat_id), text, metadata=metadata)
+                else:
+                    await adapter.send(str(home.chat_id), text)
+                channel_deliveries += 1
+            except Exception as exc:
+                logger.warning(
+                    "HARP alert failed for %s:%s: %s",
+                    platform.value,
+                    home.chat_id,
+                    exc,
+                )
+        webhook_result = await self._send_harp_alert_webhook(
+            audit_id=audit_id,
+            severity=severity,
+            message=message,
+        )
+        self._record_harp_alert_event(
+            severity=severity,
+            message=message,
+            audit_id=audit_id,
+            channel_deliveries=channel_deliveries,
+            webhook_status=str(webhook_result.get("status") or "disabled"),
+            webhook_attempts=int(webhook_result.get("attempts") or 0),
+            webhook_error=str(webhook_result.get("error") or ""),
+            webhook_signed=bool(webhook_result.get("signed") or False),
+        )
+
+    async def _send_harp_alert_webhook(
+        self,
+        *,
+        audit_id: str,
+        severity: str,
+        message: str,
+    ) -> dict[str, Any]:
+        if severity != "critical":
+            return {"status": "skipped", "attempts": 0, "error": ""}
+        try:
+            cfg = _load_gateway_config()
+            harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+        except Exception:
+            harp_cfg = {}
+        if not isinstance(harp_cfg, dict):
+            return {"status": "disabled", "attempts": 0, "error": ""}
+        url = str(harp_cfg.get("alert_webhook_url") or "").strip()
+        if not url:
+            return {"status": "disabled", "attempts": 0, "error": ""}
+        timeout_seconds = int(harp_cfg.get("alert_webhook_timeout_seconds") or 5)
+        max_retries = int(harp_cfg.get("alert_webhook_max_retries") or 2)
+        max_skew_seconds = int(harp_cfg.get("alert_webhook_max_skew_seconds") or 300)
+        webhook_secret = str(harp_cfg.get("alert_webhook_secret") or "")
+        if timeout_seconds < 1:
+            timeout_seconds = 1
+        if max_retries < 0:
+            max_retries = 0
+        payload = {
+            "audit_id": audit_id,
+            "source": "harp_routing",
+            "severity": severity,
+            "message": message,
+            "nonce": uuid.uuid4().hex,
+            "sent_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "max_skew_seconds": max_skew_seconds,
+            "timestamp": time.time(),
+        }
+        payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        headers = {
+            "Content-Type": "application/json",
+            "X-HARP-Audit-Id": audit_id,
+            "X-HARP-Max-Skew-Seconds": str(max_skew_seconds),
+        }
+        signed = False
+        if webhook_secret:
+            digest = hmac.new(
+                webhook_secret.encode("utf-8"),
+                payload_json.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-HARP-Signature"] = f"sha256={digest}"
+            signed = True
+        attempts = 0
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            attempts += 1
+            try:
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                    resp = await client.post(url, content=payload_json, headers=headers)
+                if 200 <= resp.status_code < 300:
+                    return {"status": "sent", "attempts": attempts, "error": "", "signed": signed}
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    last_error = f"http_{resp.status_code}"
+                else:
+                    return {
+                        "status": "failed",
+                        "attempts": attempts,
+                        "error": f"http_{resp.status_code}",
+                        "signed": signed,
+                    }
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < max_retries:
+                await asyncio.sleep(min(5.0, float(2 ** attempt)))
+        return {"status": "failed", "attempts": attempts, "error": last_error, "signed": signed}
+
+    def _record_harp_alert_event(
+        self,
+        *,
+        severity: str,
+        message: str,
+        audit_id: str = "",
+        channel_deliveries: int = 0,
+        webhook_status: str = "",
+        webhook_attempts: int = 0,
+        webhook_error: str = "",
+        webhook_signed: bool = False,
+    ) -> None:
+        now_ts = time.time()
+        alerts = list(getattr(self, "_harp_routing_alert_history", []) or [])
+        alerts.append(
+            {
+                "severity": str(severity or "warning"),
+                "message": str(message or ""),
+                "timestamp": now_ts,
+                "audit_id": str(audit_id or ""),
+                "channel_deliveries": int(channel_deliveries or 0),
+                "webhook_status": str(webhook_status or ""),
+                "webhook_attempts": int(webhook_attempts or 0),
+                "webhook_error": str(webhook_error or ""),
+                "webhook_signed": bool(webhook_signed),
+            }
+        )
+        max_alerts = 50
+        max_age_days = 14
+        try:
+            cfg = _load_gateway_config()
+            harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+            if isinstance(harp_cfg, dict):
+                max_alerts = int(harp_cfg.get("alert_history_size") or 50)
+                max_age_days = int(harp_cfg.get("history_max_age_days") or 14)
+        except Exception:
+            pass
+        if max_alerts < 1:
+            max_alerts = 1
+        if max_age_days > 0:
+            cutoff = now_ts - (max_age_days * 86400)
+            alerts = [item for item in alerts if float(item.get("timestamp") or 0.0) >= cutoff]
+        if len(alerts) > max_alerts:
+            alerts = alerts[-max_alerts:]
+        self._harp_routing_alert_history = alerts
+        try:
+            self._persist_harp_routing_status()
+        except Exception as exc:
+            logger.warning("Failed to persist HARP alert history: %s", exc)
 
     def _save_voice_modes(self) -> None:
         try:
@@ -2766,7 +3053,186 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        now_ts = time.time()
+
+        def _record_harp_status(
+            state: str,
+            *,
+            provider: str = "",
+            selected_model: str = "",
+            reason: str = "",
+        ) -> None:
+            entry = {
+                "state": state,
+                "decision_id": uuid.uuid4().hex,
+                "provider": provider,
+                "model": selected_model,
+                "reason": reason,
+                "session_key": resolved_session_key or "",
+                "timestamp": now_ts,
+            }
+            self._harp_routing_status = entry
+
+            history = list(getattr(self, "_harp_routing_history", []) or [])
+            history.append(entry)
+            max_history = 20
+            max_age_days = 14
+            try:
+                _cfg = _load_gateway_config()
+                _harp_cfg = _cfg.get("harp_routing", {})
+                if isinstance(_harp_cfg, dict):
+                    max_history = int(_harp_cfg.get("history_size") or 20)
+                    max_age_days = int(_harp_cfg.get("history_max_age_days") or 14)
+            except Exception:
+                pass
+            if max_history < 1:
+                max_history = 1
+            if max_age_days > 0:
+                cutoff = now_ts - (max_age_days * 86400)
+                history = [item for item in history if float(item.get("timestamp") or 0.0) >= cutoff]
+            if len(history) > max_history:
+                history = history[-max_history:]
+            self._harp_routing_history = history
+            try:
+                self._persist_harp_routing_status()
+            except Exception as exc:
+                logger.warning("Failed to persist HARP routing status/history: %s", exc)
+
+            try:
+                cfg = _load_gateway_config()
+                harp_cfg = cfg.get("harp_routing", {})
+                if not isinstance(harp_cfg, dict):
+                    return
+
+                # Auto-disable path (failure spike).
+                if state == "failed":
+                    if not bool(harp_cfg.get("enabled")):
+                        return
+                    threshold = int(harp_cfg.get("auto_disable_failure_threshold") or 0)
+                    window_seconds = int(harp_cfg.get("auto_disable_window_seconds") or 0)
+                    if threshold < 1 or window_seconds < 1:
+                        return
+                    cutoff = now_ts - window_seconds
+                    recent_failures = [
+                        item for item in history
+                        if item.get("state") == "failed" and float(item.get("timestamp") or 0.0) >= cutoff
+                    ]
+                    if bool(harp_cfg.get("alert_on_auto_disable")) and len(recent_failures) == max(1, threshold - 1):
+                        loop = getattr(self, "_gateway_loop", None)
+                        if loop and loop.is_running():
+                            loop.create_task(
+                                self._send_harp_alert(
+                                    severity="warning",
+                                    message=(
+                                        f"failure count {len(recent_failures)}/{threshold} "
+                                        f"in {window_seconds}s window"
+                                    ),
+                                )
+                            )
+                    if len(recent_failures) < threshold:
+                        return
+                    harp_cfg["enabled"] = False
+                    cfg["harp_routing"] = harp_cfg
+                    atomic_yaml_write(_hermes_home / "config.yaml", cfg, sort_keys=False)
+                    self._harp_routing_status = {
+                        "state": "auto_disabled",
+                        "decision_id": uuid.uuid4().hex,
+                        "provider": provider,
+                        "model": selected_model,
+                        "reason": (
+                            f"auto-disabled after {len(recent_failures)} failures "
+                            f"in {window_seconds}s window"
+                        ),
+                        "session_key": resolved_session_key or "",
+                        "timestamp": now_ts,
+                    }
+                    history.append(self._harp_routing_status)
+                    if len(history) > max_history:
+                        history = history[-max_history:]
+                    self._harp_routing_history = history
+                    try:
+                        self._persist_harp_routing_status()
+                    except Exception:
+                        pass
+                    logger.warning("Auto-disabled harp_routing after repeated failures")
+                    if bool(harp_cfg.get("alert_on_auto_disable")):
+                        loop = getattr(self, "_gateway_loop", None)
+                        if loop and loop.is_running():
+                            loop.create_task(
+                                self._send_harp_alert(
+                                    severity="critical",
+                                    message=self._harp_routing_status["reason"],
+                                )
+                            )
+                    return
+
+                # Auto-reenable path (clean window after cooldown).
+                if bool(harp_cfg.get("enabled")):
+                    return
+                cooldown = int(harp_cfg.get("auto_reenable_cooldown_seconds") or 0)
+                min_clean = int(harp_cfg.get("auto_reenable_min_clean_decisions") or 0)
+                if cooldown < 1 or min_clean < 1:
+                    return
+                auto_disabled_points = [
+                    float(item.get("timestamp") or 0.0)
+                    for item in history
+                    if item.get("state") == "auto_disabled"
+                ]
+                if not auto_disabled_points:
+                    return
+                last_disabled = max(auto_disabled_points)
+                if now_ts < last_disabled + cooldown:
+                    return
+                post_window = [
+                    item for item in history
+                    if float(item.get("timestamp") or 0.0) >= last_disabled
+                ]
+                if any(item.get("state") == "failed" for item in post_window):
+                    return
+                clean_count = sum(
+                    1 for item in post_window
+                    if item.get("state") in {"no_decision", "applied", "session_override"}
+                )
+                if clean_count < min_clean:
+                    return
+                harp_cfg["enabled"] = True
+                cfg["harp_routing"] = harp_cfg
+                atomic_yaml_write(_hermes_home / "config.yaml", cfg, sort_keys=False)
+                self._harp_routing_status = {
+                    "state": "auto_reenabled",
+                    "decision_id": uuid.uuid4().hex,
+                    "provider": "",
+                    "model": "",
+                    "reason": (
+                        f"auto-reenabled after cooldown={cooldown}s and "
+                        f"{clean_count} clean decisions"
+                    ),
+                    "session_key": resolved_session_key or "",
+                    "timestamp": now_ts,
+                }
+                history.append(self._harp_routing_status)
+                if len(history) > max_history:
+                    history = history[-max_history:]
+                self._harp_routing_history = history
+                try:
+                    self._persist_harp_routing_status()
+                except Exception:
+                    pass
+                logger.warning("Auto-reenabled harp_routing after clean cooldown window")
+                if bool(harp_cfg.get("alert_on_auto_disable")):
+                    loop = getattr(self, "_gateway_loop", None)
+                    if loop and loop.is_running():
+                        loop.create_task(
+                            self._send_harp_alert(
+                                severity="warning",
+                                message=self._harp_routing_status["reason"],
+                            )
+                        )
+            except Exception as exc:
+                logger.warning("HARP routing policy update failed: %s", exc)
+
         if override:
+            _record_harp_status("session_override")
             override_model = override.get("model", model)
             override_runtime = {
                 "provider": override.get("provider"),
@@ -2795,7 +3261,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_kwargs: dict | None = None
+        if not override:
+            harp_status_recorded = False
+            try:
+                from hermes_cli.harp_routing import resolve_harp_route_decision
+
+                harp_decision = resolve_harp_route_decision()
+            except Exception:
+                harp_decision = None
+            if harp_decision is not None:
+                remaining = self._harp_provider_cooldown_remaining(
+                    harp_decision.provider, now_ts
+                )
+                if remaining > 0:
+                    _record_harp_status(
+                        "provider_cooldown",
+                        provider=harp_decision.provider,
+                        selected_model=harp_decision.model,
+                        reason=f"cooldown active ({int(remaining)}s remaining)",
+                    )
+                    harp_status_recorded = True
+                    harp_decision = None
+            if harp_decision is not None:
+                try:
+                    runtime_kwargs = _resolve_runtime_agent_kwargs(
+                        requested_provider=harp_decision.provider
+                    )
+                    logger.info(
+                        "HARP routing selected provider=%s model=%s for session=%s",
+                        harp_decision.provider,
+                        harp_decision.model,
+                        resolved_session_key or "",
+                    )
+                    _record_harp_status(
+                        "applied",
+                        provider=harp_decision.provider,
+                        selected_model=harp_decision.model,
+                    )
+                    if harp_decision.model:
+                        model = harp_decision.model
+                except Exception as exc:
+                    logger.warning(
+                        "HARP routing decision failed provider resolution (provider=%s): %s",
+                        harp_decision.provider,
+                        exc,
+                    )
+                    _record_harp_status(
+                        "failed",
+                        provider=harp_decision.provider,
+                        selected_model=harp_decision.model,
+                        reason=str(exc),
+                    )
+                    runtime_kwargs = None
+            else:
+                if not harp_status_recorded:
+                    _record_harp_status("no_decision")
+
+        if runtime_kwargs is None:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -6645,6 +7169,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+            if event.get_command() in {"harp-status", "harp_status"}:
+                return await self._handle_harp_status_command(event)
+            if event.get_command() in {"harp-verify", "harp_verify"}:
+                return await self._handle_harp_verify_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
@@ -7028,7 +7556,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # run every command. When set → non-admins can run only commands in
         # ``user_allowed_commands`` (plus the always-allowed floor: /help,
         # /whoami). Plain chat is unaffected — only slash commands gate.
-        if command and canonical and is_gateway_known_command(canonical):
+        if command and canonical and (
+            is_gateway_known_command(canonical)
+            or canonical in {"harp-status", "harp_status", "harp-verify", "harp_verify"}
+        ):
             _denied = self._check_slash_access(source, canonical)
             if _denied is not None:
                 return _denied
@@ -7040,7 +7571,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the previous fire-and-forget emit(): return values are now
         # honored, but handlers that return nothing behave exactly as
         # before (telemetry-style hooks keep working).
-        if command and is_gateway_known_command(canonical):
+        if command and (
+            is_gateway_known_command(canonical)
+            or canonical in {"harp-status", "harp_status", "harp-verify", "harp_verify"}
+        ):
             raw_args = event.get_command_args().strip()
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -7125,6 +7659,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical in {"harp-status", "harp_status"}:
+            return await self._handle_harp_status_command(event)
+        if canonical in {"harp-verify", "harp_verify"}:
+            return await self._handle_harp_verify_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
