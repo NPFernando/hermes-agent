@@ -840,6 +840,75 @@ class TestConvertMessages:
         assert len(tool_results) == 1
         assert tool_results[0]["tool_use_id"] == "tc_valid"
 
+    def test_preserves_paired_server_tool_use_and_advisor_result_in_assistant_turn(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I'll consult the advisor."},
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "advisor",
+                        "input": {},
+                        "caller": {"type": "direct", "output_only": "drop"},
+                        "output_only": "drop",
+                    },
+                    {
+                        "type": "advisor_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": {
+                            "type": "advisor_result",
+                            "text": "Keep the original advice payload.",
+                        },
+                        "output_only": "drop",
+                    },
+                    {"type": "text", "text": "Here is the answer."},
+                ],
+            },
+        ]
+
+        _, result = convert_messages_to_anthropic(messages)
+
+        content = result[0]["content"]
+        assert [block["type"] for block in content] == [
+            "text",
+            "server_tool_use",
+            "advisor_tool_result",
+            "text",
+        ]
+        assert content[1]["caller"] == {"type": "direct"}
+        assert "output_only" not in content[1]
+        assert content[2]["content"] == {
+            "type": "advisor_result",
+            "text": "Keep the original advice payload.",
+        }
+
+    def test_strips_orphaned_advisor_result_and_server_tool_use(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Visible context."},
+                    {
+                        "type": "advisor_tool_result",
+                        "tool_use_id": "srvtoolu_missing",
+                        "content": {"type": "advisor_result", "text": "stale"},
+                    },
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_orphan",
+                        "name": "advisor",
+                        "input": {},
+                    },
+                ],
+            },
+        ]
+
+        _, result = convert_messages_to_anthropic(messages)
+
+        assert result[0]["content"] == [{"type": "text", "text": "Visible context."}]
+
     def test_system_with_cache_control(self):
         messages = [
             {
