@@ -344,6 +344,22 @@ function buildRoutes(
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
+/**
+ * Whether closing the mobile nav should move focus back to the button that
+ * opened it — true only on the open->closed transition, and only if that
+ * button is still connected to the document (it can unmount mid-open, e.g.
+ * a viewport resize past the desktop breakpoint hides the mobile header
+ * entirely). Exported so the transition logic is unit-testable without
+ * rendering the whole App tree.
+ */
+export function shouldRestoreMobileMenuFocus(
+  wasOpen: boolean,
+  isOpen: boolean,
+  button: { isConnected: boolean } | null,
+): boolean {
+  return wasOpen && !isOpen && button !== null && button.isConnected;
+}
+
 export default function App() {
   const { t } = useI18n();
   const { pathname } = useLocation();
@@ -351,6 +367,10 @@ export default function App() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+  // The hamburger button that opens the mobile nav — focus returns here when
+  // it closes (Escape, backdrop click, or a nav link), so keyboard/screen
+  // reader users land back where they started instead of on <body>.
+  const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
 
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -468,6 +488,25 @@ export default function App() {
     };
   }, [mobileOpen]);
 
+  // Runs on the mobileOpen -> false transition (the cleanup above fires on
+  // every close reason: Escape, backdrop click, or a nav link inside the
+  // panel), restoring focus to the button that opened it. Guarded by
+  // isConnected in case the trigger itself unmounted in the meantime (e.g.
+  // a viewport resize past the desktop breakpoint while the menu was open).
+  const wasMobileOpenRef = useRef(false);
+  useEffect(() => {
+    if (
+      shouldRestoreMobileMenuFocus(
+        wasMobileOpenRef.current,
+        mobileOpen,
+        mobileMenuButtonRef.current,
+      )
+    ) {
+      mobileMenuButtonRef.current?.focus();
+    }
+    wasMobileOpenRef.current = mobileOpen;
+  }, [mobileOpen]);
+
   useEffect(() => {
     const mql = window.matchMedia("(min-width: 1024px)");
     const onChange = (e: MediaQueryListEvent) => {
@@ -507,6 +546,7 @@ export default function App() {
         }}
       >
         <Button
+          ref={mobileMenuButtonRef}
           ghost
           size="icon"
           onClick={() => setMobileOpen(true)}
