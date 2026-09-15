@@ -90,6 +90,7 @@ export const en: Translations = {
     openNavigation: "Open navigation",
     pluginNavSection: "Plugins",
     sessionsActiveCount: "{count} active",
+    skipToMainContent: "Skip to main content",
     statusOverview: "Status overview",
     system: "System",
     webUi: "Web UI",
