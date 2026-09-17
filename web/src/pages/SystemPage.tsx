@@ -54,6 +54,10 @@ import type {
   CuratorStatus,
   PortalStatus,
   DebugShareResponse,
+  HarpStatusResponse,
+  HarpStatusMetricsResponse,
+  HarpStatusLintResponse,
+  HarpSeverityResetAuditStatsResponse,
 } from "@/lib/api";
 
 function formatBytes(n: number): string {
@@ -70,6 +74,26 @@ function formatDuration(seconds: number): string {
   if (d > 0) return `${d}d ${h}h ${m}m`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+function sparkline(values: number[]): string {
+  if (!values.length) return "";
+  const ticks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  if (max <= min) return values.map(() => "▅").join("");
+  return values
+    .map((v) => {
+      const idx = Math.max(0, Math.min(ticks.length - 1, Math.round(((v - min) / (max - min)) * (ticks.length - 1))));
+      return ticks[idx];
+    })
+    .join("");
+}
+
+function lockAlertSeverityTone(severity?: string): "destructive" | "warning" | "secondary" {
+  if (severity === "critical") return "destructive";
+  if (severity === "warn") return "warning";
+  return "secondary";
 }
 
 /**
@@ -159,6 +183,182 @@ export default function SystemPage() {
   const [hooks, setHooks] = useState<HooksResponse | null>(null);
   const [curator, setCurator] = useState<CuratorStatus | null>(null);
   const [portal, setPortal] = useState<PortalStatus | null>(null);
+  const [harpStatus, setHarpStatus] = useState<HarpStatusResponse | null>(null);
+  const [harpMetrics, setHarpMetrics] = useState<HarpStatusMetricsResponse | null>(null);
+  const [harpLint, setHarpLint] = useState<HarpStatusLintResponse | null>(null);
+  const [harpLintHistoryCount, setHarpLintHistoryCount] = useState(0);
+  const [harpResetAudit, setHarpResetAudit] = useState<
+    Array<{
+      audit_id?: string;
+      timestamp: number;
+      allowed: boolean;
+      actor_tag: string;
+      reason: string;
+      scope: string;
+      key: string;
+      removed: number;
+      deny_reason_hit?: boolean;
+      reason_masked?: boolean;
+    }>
+  >([]);
+  const [harpUnmuteWasMutedFilter, setHarpUnmuteWasMutedFilter] = useState("all");
+  const [harpUnmuteReasonFilter, setHarpUnmuteReasonFilter] = useState("");
+  const [harpUnmuteSortBy, setHarpUnmuteSortBy] = useState<"timestamp" | "actor_tag" | "reason">("timestamp");
+  const [harpResetAuditCursorToken, setHarpResetAuditCursorToken] = useState<string | null>(null);
+  const [harpResetAuditHasMore, setHarpResetAuditHasMore] = useState(false);
+  const [harpResetAuditReasonVisibility, setHarpResetAuditReasonVisibility] =
+    useState<"full" | "partial" | "masked">("full");
+  const [harpResetAuditStats, setHarpResetAuditStats] =
+    useState<HarpSeverityResetAuditStatsResponse | null>(null);
+  const [harpCompactingAudit, setHarpCompactingAudit] = useState(false);
+  const [harpCompactionAudit, setHarpCompactionAudit] = useState<
+    Array<{
+      timestamp: number;
+      trigger: string;
+      actor_tag: string;
+      before: number;
+      after: number;
+      partitions: number;
+    }>
+  >([]);
+  const [harpCompactionAlerts, setHarpCompactionAlerts] = useState<
+    Array<{
+      timestamp: number;
+      warnings: string[];
+      warning_details?: Array<{ code: string; severity: string }>;
+      rows: number;
+      partitions: number;
+      last_compact_ts?: number;
+      high_severity?: boolean;
+      previous_warnings?: string[];
+    }>
+  >([]);
+  const [harpCompactionWebhookAudit, setHarpCompactionWebhookAudit] = useState<
+    Array<{
+      timestamp: number;
+      warnings: string[];
+      attempts: number;
+      sent: boolean;
+      last_error: string;
+      latency_ms?: number | null;
+    }>
+  >([]);
+  const [harpUnmuteAudit, setHarpUnmuteAudit] = useState<
+    Array<{
+      timestamp: number;
+      actor_tag: string;
+      reason: string;
+      was_muted: boolean;
+      previous_muted_until?: number | null;
+    }>
+  >([]);
+  const [harpVerifyAudit, setHarpVerifyAudit] = useState<
+    Array<{
+      timestamp: number;
+      actor_tag: string;
+      ok: boolean;
+      stream: string;
+      verifier_id?: string;
+      nonce?: string;
+    }>
+  >([]);
+  const [harpVerifyNonceDuplicateCount, setHarpVerifyNonceDuplicateCount] = useState(0);
+  const [harpVerifyNonceDuplicateByStream, setHarpVerifyNonceDuplicateByStream] = useState<Record<string, number>>(
+    {},
+  );
+  const [harpVerifyActiveLocks, setHarpVerifyActiveLocks] = useState<Record<string, number>>({});
+  const [harpVerifyLockSummary, setHarpVerifyLockSummary] = useState<{
+    locked_verifier_count: number;
+    soonest_unlock_at?: number | null;
+    lock_entries_24h: number;
+    lock_entries_windows?: {
+      last_1h: number;
+      last_24h: number;
+      last_7d: number;
+    };
+    active_locks_alert?: boolean;
+    active_locks_threshold?: number;
+    active_locks_alert_dwell_seconds?: number;
+    active_locks_alert_dwell_severity?: "none" | "warn" | "critical" | string;
+  } | null>(null);
+  const [harpVerifyLockNotifyMetrics, setHarpVerifyLockNotifyMetrics] = useState<{
+    attempted: number;
+    sent: number;
+    failed: number;
+    success_rate: number;
+    p95_latency_ms?: number | null;
+    windows?: {
+      last_1h: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_rate: number;
+        p95_latency_ms?: number | null;
+      };
+      last_24h: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_rate: number;
+        p95_latency_ms?: number | null;
+      };
+    };
+  } | null>(null);
+  const [harpVerifyLockAlerts, setHarpVerifyLockAlerts] = useState<
+    Array<{
+      timestamp: number;
+      active: boolean;
+      locked_verifier_count: number;
+      threshold: number;
+    }>
+  >([]);
+  const [harpVerifyDuplicateHeatmap, setHarpVerifyDuplicateHeatmap] = useState<
+    Record<string, { last_10m: number; last_1h: number; last_24h: number }>
+  >({});
+  const [harpVerifierUnlockAudit, setHarpVerifierUnlockAudit] = useState<
+    Array<{
+      timestamp: number;
+      actor_tag: string;
+      verifier_id: string;
+      reason: string;
+      was_locked: boolean;
+      previous_locked_until?: number | null;
+    }>
+  >([]);
+  const [harpVerifierUnlockId, setHarpVerifierUnlockId] = useState("");
+  const [harpVerifyLockAudit, setHarpVerifyLockAudit] = useState<
+    Array<{ timestamp: number; action: string; verifier_id: string; locked_until?: number | null }>
+  >([]);
+  const [harpVerifyLockBundleFormat, setHarpVerifyLockBundleFormat] = useState<"json" | "csv">("json");
+  const [harpVerifyLockAlertsExportFormat, setHarpVerifyLockAlertsExportFormat] = useState<"json" | "csv">("json");
+  const [harpVerifyLockAlertsActiveFilter, setHarpVerifyLockAlertsActiveFilter] = useState("all");
+  const [harpCompactionActorFilter, setHarpCompactionActorFilter] = useState("ops-admin");
+  const [harpCompactionTriggerFilter, setHarpCompactionTriggerFilter] = useState("all");
+  const [harpCompactionSinceWindow, setHarpCompactionSinceWindow] = useState("24h");
+  const [harpWebhookStatusFilter, setHarpWebhookStatusFilter] = useState("all");
+  const [harpWebhookLatencyMinFilter, setHarpWebhookLatencyMinFilter] = useState("");
+  const [harpWebhookErrorFilter, setHarpWebhookErrorFilter] = useState("");
+  const [harpCompactionExportStream, setHarpCompactionExportStream] = useState<
+    "alerts" | "webhook" | "unmute" | "verify_unlock"
+  >(
+    "alerts",
+  );
+  const [harpCompactionExportFormat, setHarpCompactionExportFormat] = useState<"json" | "csv">("json");
+  const backoffTransitionRef = useRef<string>("");
+  const [harpAuditActorFilter, setHarpAuditActorFilter] = useState("");
+  const [harpAuditAllowedFilter, setHarpAuditAllowedFilter] = useState("all");
+  const [harpAuditKeyFilter, setHarpAuditKeyFilter] = useState("");
+  const [harpAuditSinceWindow, setHarpAuditSinceWindow] = useState("all");
+  const [harpAuditSort, setHarpAuditSort] = useState<"newest" | "oldest">("newest");
+  const [harpSeverityFilter, setHarpSeverityFilter] = useState("all");
+  const [harpClock, setHarpClock] = useState(() => Date.now());
+  const [harpTail, setHarpTail] = useState("20");
+  const [harpAutoRefresh, setHarpAutoRefresh] = useState(true);
+  const [harpCursor, setHarpCursor] = useState<string>("");
+  const [harpCsvColumns, setHarpCsvColumns] = useState<"minimal" | "full">("full");
+  const harpCursorRef = useRef<string>("");
+  const harpStatusRef = useRef<HarpStatusResponse | null>(null);
+  const harpResetAuditCursorTokenRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -229,6 +429,308 @@ export default function SystemPage() {
     loadAll();
   }, [loadAll]);
 
+  useEffect(() => {
+    harpCursorRef.current = harpCursor;
+  }, [harpCursor]);
+
+  useEffect(() => {
+    harpStatusRef.current = harpStatus;
+  }, [harpStatus]);
+
+  useEffect(() => {
+    harpResetAuditCursorTokenRef.current = harpResetAuditCursorToken;
+  }, [harpResetAuditCursorToken]);
+
+  const loadHarpResetAudit = useCallback(
+    (append = false) => {
+      const now = Date.now() / 1000;
+      const sinceMap: Record<string, number> = {
+        "1h": now - 3600,
+        "24h": now - 86400,
+        "7d": now - 604800,
+      };
+      const compactionSinceMap: Record<string, number> = {
+        "1h": now - 3600,
+        "24h": now - 86400,
+        "7d": now - 604800,
+      };
+      const windowHoursMap: Record<string, number> = {
+        "1h": 1,
+        "24h": 24,
+        "7d": 168,
+      };
+      const bucketMap: Record<string, "1m" | "5m" | "1h"> = {
+        "1h": "1m",
+        "24h": "5m",
+        "7d": "1h",
+      };
+      const allowedFilter =
+        harpAuditAllowedFilter === "allowed"
+          ? true
+          : harpAuditAllowedFilter === "denied"
+            ? false
+            : undefined;
+      api
+        .getHarpSeverityResetAudit(20, {
+          sort: harpAuditSort,
+          viewerTag: "dashboard",
+          limit: 20,
+          actor: harpAuditActorFilter.trim() || undefined,
+          allowed: allowedFilter,
+          since: sinceMap[harpAuditSinceWindow],
+          cursorToken: append ? harpResetAuditCursorTokenRef.current ?? undefined : undefined,
+        })
+        .then((data) => {
+          setHarpResetAuditReasonVisibility(data.reason_visibility ?? "full");
+          setHarpResetAuditCursorToken(data.next_cursor_token ?? null);
+          setHarpResetAuditHasMore(Boolean(data.has_more ?? data.next_cursor_token));
+          if (!append) {
+            setHarpResetAudit(data.audit);
+            return;
+          }
+          setHarpResetAudit((prev) => {
+            const seen = new Set(
+              prev.map(
+                (row) =>
+                  row.audit_id ??
+                  `${row.timestamp}-${row.actor_tag}-${row.scope}-${row.key}-${row.removed}`,
+              ),
+            );
+            const merged = [...prev];
+            for (const row of data.audit) {
+              const key =
+                row.audit_id ??
+                `${row.timestamp}-${row.actor_tag}-${row.scope}-${row.key}-${row.removed}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              merged.push(row);
+            }
+            return merged;
+          });
+        })
+        .catch(() => {});
+      api
+        .getHarpSeverityResetAuditStats(
+          windowHoursMap[harpAuditSinceWindow] ?? 24,
+          harpAuditActorFilter.trim() || undefined,
+          {
+            actorTag: "ops-admin",
+            windowBucket: bucketMap[harpAuditSinceWindow] ?? "1h",
+          },
+        )
+        .then((stats) => {
+          setHarpResetAuditStats(stats);
+          const transition = stats.compaction_health?.backoff_transition;
+          if (transition?.timestamp) {
+            const key = `${transition.timestamp}:${transition.from}->${transition.to}`;
+            if (backoffTransitionRef.current !== key) {
+              backoffTransitionRef.current = key;
+              showToast(
+                transition.to === "muted"
+                  ? "Compaction webhook entered auto-backoff mute"
+                  : "Compaction webhook exited backoff mute",
+                transition.to === "muted" ? "error" : "success",
+              );
+            }
+          }
+        })
+        .catch(() => {});
+      api
+        .getHarpSeverityResetCompactionAudit(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          trigger:
+            harpCompactionTriggerFilter === "all"
+              ? undefined
+              : (harpCompactionTriggerFilter as "auto" | "manual"),
+          since: compactionSinceMap[harpCompactionSinceWindow],
+        })
+        .then((data) => setHarpCompactionAudit(data.audit))
+        .catch(() => {});
+      api
+        .getHarpSeverityResetCompactionAlerts(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          since: compactionSinceMap[harpCompactionSinceWindow],
+        })
+        .then((data) => setHarpCompactionAlerts(data.alerts))
+        .catch(() => {});
+      api
+        .getHarpSeverityResetCompactionWebhookAudit(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          since: compactionSinceMap[harpCompactionSinceWindow],
+          sent:
+            harpWebhookStatusFilter === "sent"
+              ? true
+              : harpWebhookStatusFilter === "failed"
+                ? false
+                : undefined,
+          minLatencyMs: harpWebhookLatencyMinFilter.trim()
+            ? Number.parseInt(harpWebhookLatencyMinFilter.trim(), 10)
+            : undefined,
+          errorContains: harpWebhookErrorFilter.trim() || undefined,
+        })
+        .then((data) => setHarpCompactionWebhookAudit(data.audit))
+        .catch(() => {});
+      api
+        .getHarpSeverityResetUnmuteAudit(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          since: compactionSinceMap[harpCompactionSinceWindow],
+          wasMuted:
+            harpUnmuteWasMutedFilter === "true"
+              ? true
+              : harpUnmuteWasMutedFilter === "false"
+                ? false
+                : undefined,
+          reasonContains: harpUnmuteReasonFilter.trim() || undefined,
+          sortBy: harpUnmuteSortBy,
+        })
+        .then((data) => setHarpUnmuteAudit(data.audit))
+        .catch(() => {});
+      api
+        .getHarpSeverityResetVerifyAudit(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          since: compactionSinceMap[harpCompactionSinceWindow],
+          limit: 10,
+          sort: "newest",
+        })
+        .then((data) => {
+          setHarpVerifyAudit(data.audit);
+          setHarpVerifyNonceDuplicateCount(data.nonce_duplicate_count || 0);
+          setHarpVerifyNonceDuplicateByStream(data.nonce_duplicate_count_by_stream || {});
+          setHarpVerifyActiveLocks(data.active_verifier_locks || {});
+          setHarpVerifyDuplicateHeatmap(data.duplicate_heatmap || {});
+          setHarpVerifyLockSummary(data.lock_summary || null);
+          setHarpVerifyLockNotifyMetrics(data.lock_notify_metrics || null);
+        })
+        .catch(() => {});
+      api
+        .getHarpSeverityResetVerifyUnlockAudit(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          since: compactionSinceMap[harpCompactionSinceWindow],
+          limit: 10,
+          sort: "newest",
+        })
+        .then((data) => setHarpVerifierUnlockAudit(data.audit))
+        .catch(() => {});
+      api
+        .getHarpSeverityResetVerifyLockAudit(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          since: compactionSinceMap[harpCompactionSinceWindow],
+          limit: 10,
+          sort: "newest",
+        })
+        .then((data) => setHarpVerifyLockAudit(data.audit))
+        .catch(() => {});
+      api
+        .getHarpSeverityResetVerifyLockAlerts(10, {
+          actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+          active:
+            harpVerifyLockAlertsActiveFilter === "on"
+              ? true
+              : harpVerifyLockAlertsActiveFilter === "off"
+                ? false
+                : undefined,
+          since: compactionSinceMap[harpCompactionSinceWindow],
+          limit: 10,
+          sort: "newest",
+        })
+        .then((data) => setHarpVerifyLockAlerts(data.alerts || []))
+        .catch(() => {});
+    },
+    [
+      harpAuditSort,
+      harpAuditActorFilter,
+      harpAuditAllowedFilter,
+      harpAuditSinceWindow,
+      harpCompactionActorFilter,
+      harpCompactionTriggerFilter,
+      harpCompactionSinceWindow,
+      harpWebhookStatusFilter,
+      harpWebhookLatencyMinFilter,
+      harpWebhookErrorFilter,
+      harpUnmuteWasMutedFilter,
+      harpUnmuteReasonFilter,
+      harpUnmuteSortBy,
+      harpVerifyLockAlertsActiveFilter,
+      showToast,
+    ],
+  );
+
+  const loadHarpStatus = useCallback((incremental = false) => {
+    const tail = Number.parseInt(harpTail, 10);
+    const safeTail = Number.isFinite(tail) ? Math.max(1, Math.min(200, tail)) : 20;
+    const sinceId = incremental && harpCursorRef.current ? harpCursorRef.current : undefined;
+    api
+      .getHarpStatus({
+        tail: safeTail,
+        sinceId,
+        severity: harpSeverityFilter,
+      })
+      .then((data) => {
+        const prev = harpStatusRef.current;
+        if (incremental && prev) {
+          const history = [...prev.history, ...data.history].slice(-safeTail);
+          const alerts = [...prev.alerts, ...data.alerts].slice(-safeTail);
+          setHarpStatus({ ...data, history, alerts });
+        } else {
+          setHarpStatus(data);
+        }
+        if (data.next_since_id) {
+          setHarpCursor(data.next_since_id);
+          harpCursorRef.current = data.next_since_id;
+        }
+      })
+      .catch(() => {});
+    api
+      .getHarpStatusMetrics(24, "1h", 1, 1, 1, 2, 300, "dashboard-main")
+      .then((data) => setHarpMetrics(data))
+      .catch(() => {});
+    api
+      .getHarpStatusLint(false)
+      .then((data) => setHarpLint(data))
+      .catch(() => {});
+    api
+      .getHarpStatusLintHistory(10)
+      .then((data) => setHarpLintHistoryCount(data.history.length))
+      .catch(() => {});
+  }, [harpTail, harpSeverityFilter]);
+
+  useEffect(() => {
+    harpCursorRef.current = "";
+    loadHarpStatus(false);
+  }, [harpTail, harpSeverityFilter, loadHarpStatus]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setHarpClock(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    loadHarpResetAudit(false);
+  }, [
+    loadHarpResetAudit,
+    harpAuditSort,
+    harpAuditActorFilter,
+    harpAuditAllowedFilter,
+    harpAuditSinceWindow,
+    harpCompactionActorFilter,
+    harpCompactionTriggerFilter,
+    harpCompactionSinceWindow,
+    harpWebhookStatusFilter,
+    harpWebhookLatencyMinFilter,
+    harpWebhookErrorFilter,
+    harpUnmuteWasMutedFilter,
+    harpUnmuteReasonFilter,
+    harpUnmuteSortBy,
+  ]);
+
+  useEffect(() => {
+    if (!harpAutoRefresh) return;
+    const timer = setInterval(() => {
+      loadHarpStatus(true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [harpAutoRefresh, loadHarpStatus]);
+
   // ── Gateway lifecycle ──────────────────────────────────────────────
   const runGateway = async (verb: "start" | "stop" | "restart") => {
     try {
@@ -244,8 +746,215 @@ export default function SystemPage() {
       }
       showToast(`Gateway ${verb} started`, "success");
       setTimeout(loadAll, 3000);
+      setTimeout(loadHarpStatus, 3000);
     } catch (e) {
       showToast(`Gateway ${verb} failed: ${e}`, "error");
+    }
+  };
+
+  const unmuteCompactionWebhook = async () => {
+    try {
+      await api.unmuteHarpSeverityResetWebhook(harpCompactionActorFilter.trim() || "ops-admin", "manual-unmute");
+      showToast("Compaction webhook unmuted", "success");
+      loadHarpResetAudit(false);
+    } catch (e) {
+      showToast(`Webhook unmute failed: ${e}`, "error");
+    }
+  };
+
+  const unlockVerifier = async () => {
+    if (!harpVerifierUnlockId.trim()) return;
+    try {
+      await api.unlockHarpSeverityResetVerifier(
+        harpCompactionActorFilter.trim() || "ops-admin",
+        harpVerifierUnlockId.trim(),
+        "manual-unlock",
+      );
+      showToast("Verifier unlocked", "success");
+      loadHarpResetAudit(false);
+    } catch (e) {
+      showToast(`Verifier unlock failed: ${e}`, "error");
+    }
+  };
+
+  const downloadVerifyLockBundle = async () => {
+    try {
+      const result = await api.getHarpSeverityResetVerifyLockBundleExport(
+        harpVerifyLockBundleFormat,
+        200,
+        harpCompactionActorFilter.trim() || "ops-admin",
+      );
+      if (harpVerifyLockBundleFormat === "json") {
+        const data = result as { json: unknown };
+        const blob = new Blob([JSON.stringify(data.json, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "harp-verify-lock-bundle.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } else {
+        const data = result as { blob: Blob; filename: string };
+        const url = URL.createObjectURL(data.blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = data.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    } catch (e) {
+      showToast(`Verify lock bundle export failed: ${e}`, "error");
+    }
+  };
+
+  const compactResetAudit = async () => {
+    try {
+      setHarpCompactingAudit(true);
+      const result = await api.compactHarpSeverityResetAudit(false, "ops-admin");
+      showToast(
+        `Audit compacted (${result.before} → ${result.after}, ${result.partitions} partitions)`,
+        "success",
+      );
+      loadHarpResetAudit(false);
+    } catch (e) {
+      showToast(`Audit compact failed: ${e}`, "error");
+    } finally {
+      setHarpCompactingAudit(false);
+    }
+  };
+
+  const downloadCompactionExport = async () => {
+    try {
+      const now = Date.now() / 1000;
+      const sinceMap: Record<string, number> = {
+        "1h": now - 3600,
+        "24h": now - 86400,
+        "7d": now - 604800,
+      };
+
+      const sentFilter =
+        harpWebhookStatusFilter === "sent"
+          ? true
+          : harpWebhookStatusFilter === "failed"
+            ? false
+            : undefined;
+      const result = await api.getHarpSeverityResetCompactionExport({
+        stream: harpCompactionExportStream,
+        format: harpCompactionExportFormat,
+        limit: 200,
+        sort: "newest",
+        actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+        verifierId:
+          harpCompactionExportStream === "verify_unlock" && harpVerifierUnlockId.trim()
+            ? harpVerifierUnlockId.trim()
+            : undefined,
+        since: sinceMap[harpCompactionSinceWindow],
+        sent: sentFilter,
+        minLatencyMs: harpWebhookLatencyMinFilter.trim()
+          ? Number.parseInt(harpWebhookLatencyMinFilter.trim(), 10)
+          : undefined,
+        errorContains: harpWebhookErrorFilter.trim() || undefined,
+      });
+      if (harpCompactionExportFormat === "csv") {
+        const csv = result as { blob: Blob; filename: string };
+        const url = URL.createObjectURL(csv.blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = csv.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return;
+      }
+      const jsonPayload = result as { json: unknown };
+      const blob = new Blob([JSON.stringify(jsonPayload.json, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `harp-compaction-${harpCompactionExportStream}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      showToast(`Compaction export failed: ${e}`, "error");
+    }
+  };
+
+  const downloadVerifyLockAlerts = async () => {
+    try {
+      const now = Date.now() / 1000;
+      const sinceMap: Record<string, number> = {
+        "1h": now - 3600,
+        "24h": now - 86400,
+        "7d": now - 604800,
+      };
+      const result = await api.getHarpSeverityResetVerifyLockAlertsExport({
+        format: harpVerifyLockAlertsExportFormat,
+        tail: 200,
+        limit: 200,
+        sort: "newest",
+        actorTag: harpCompactionActorFilter.trim() || "ops-admin",
+        active:
+          harpVerifyLockAlertsActiveFilter === "on"
+            ? true
+            : harpVerifyLockAlertsActiveFilter === "off"
+              ? false
+              : undefined,
+        since: sinceMap[harpCompactionSinceWindow],
+      });
+      if (harpVerifyLockAlertsExportFormat === "json") {
+        const data = result as { json: unknown };
+        const blob = new Blob([JSON.stringify(data.json, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "harp-verify-lock-alerts.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return;
+      }
+      const data = result as { blob: Blob; filename: string };
+      const url = URL.createObjectURL(data.blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = data.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      showToast(`Verify lock alerts export failed: ${e}`, "error");
+    }
+  };
+
+  const downloadHarpExport = async (format: "json" | "csv") => {
+    try {
+      const tail = Number.parseInt(harpTail, 10);
+      const safeTail = Number.isFinite(tail) ? Math.max(1, Math.min(200, tail)) : 20;
+      const result = await api.getHarpStatusExport({
+        format,
+        columns: format === "csv" ? harpCsvColumns : undefined,
+        tail: safeTail,
+        severity: harpSeverityFilter,
+      });
+      const url = URL.createObjectURL(result.blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = result.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      showToast(`HARP export failed: ${e}`, "error");
     }
   };
 
@@ -869,6 +1578,697 @@ export default function SystemPage() {
               >
                 Run now
               </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="flex flex-col gap-3 py-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <Badge tone={harpStatus?.enabled ? "success" : "secondary"}>
+                {harpStatus?.enabled ? "HARP enabled" : "HARP disabled"}
+              </Badge>
+              <span className="text-sm text-muted-foreground">
+                state: {harpStatus?.status?.state ?? "unknown"}
+                {harpStatus?.status?.provider ? ` · ${harpStatus.status.provider}` : ""}
+                {harpStatus?.status?.model ? `/${harpStatus.status.model}` : ""}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="grid gap-2">
+                <Label htmlFor="harp-severity-filter">Alert severity</Label>
+                <Select
+                  id="harp-severity-filter"
+                  value={harpSeverityFilter}
+                  onValueChange={(v) => {
+                    setHarpSeverityFilter(v);
+                    setHarpCursor("");
+                    harpCursorRef.current = "";
+                  }}
+                >
+                  <SelectOption value="all">all</SelectOption>
+                  <SelectOption value="warning">warning</SelectOption>
+                  <SelectOption value="critical">critical</SelectOption>
+                </Select>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="harp-tail">Rows</Label>
+                <Input
+                  id="harp-tail"
+                  value={harpTail}
+                  onChange={(e) => {
+                    setHarpTail(e.target.value);
+                    setHarpCursor("");
+                    harpCursorRef.current = "";
+                  }}
+                  placeholder="20"
+                />
+              </div>
+              <div className="flex items-end">
+                <Button size="sm" ghost onClick={() => loadHarpStatus()}>
+                  Refresh HARP
+                </Button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="grid gap-2">
+                <Label htmlFor="harp-csv-columns">CSV columns</Label>
+                <Select
+                  id="harp-csv-columns"
+                  value={harpCsvColumns}
+                  onValueChange={(v) => setHarpCsvColumns(v as "minimal" | "full")}
+                >
+                  <SelectOption value="full">full</SelectOption>
+                  <SelectOption value="minimal">minimal</SelectOption>
+                </Select>
+              </div>
+              <div className="flex items-end sm:col-span-2">
+                <span className="text-xs text-muted-foreground font-mono">
+                  webhook attempted={harpStatus?.webhook_metrics?.attempted ?? 0} · sent={harpStatus?.webhook_metrics?.sent ?? 0} · failed={harpStatus?.webhook_metrics?.failed ?? 0} · success={(harpStatus?.webhook_metrics?.success_ratio ?? 0).toFixed(2)}
+                  {" · 1h="}
+                  {(harpStatus?.webhook_metrics?.windows?.last_1h?.success_ratio ?? 0).toFixed(2)}
+                  {" · 24h="}
+                  {(harpStatus?.webhook_metrics?.windows?.last_24h?.success_ratio ?? 0).toFixed(2)}
+                </span>
+              </div>
+            </div>
+
+            <div className="rounded border border-border p-3">
+              <div className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">
+                Lint + severity state
+              </div>
+              <div className="space-y-1 text-xs font-mono text-muted-foreground">
+                <div>
+                  lint_ok={String(harpLint?.ok ?? false)} issues={harpLint?.issues?.length ?? 0} warnings={harpLint?.warnings?.length ?? 0}
+                </div>
+                <div>
+                  state_key={harpMetrics?.reliability?.deltas?.last_1h_vs_prev_1h?.severity_state_key ?? "dashboard-main"} severity={harpMetrics?.reliability?.deltas?.last_1h_vs_prev_1h?.severity ?? "none"} raw={harpMetrics?.reliability?.deltas?.last_1h_vs_prev_1h?.severity_raw ?? "none"}
+                </div>
+                <div>lint_history_entries={harpLintHistoryCount}</div>
+                <div className="pt-1">
+                  <Button
+                    size="sm"
+                    ghost
+                    onClick={() =>
+                      api
+                        .resetHarpSeverityState(
+                          "dashboard-main",
+                          "dashboard",
+                          "manual-reset-from-system-page",
+                        )
+                        .then(() => loadHarpStatus(false))
+                        .catch(() => {})
+                    }
+                  >
+                    Reset severity state
+                  </Button>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded border border-border p-3">
+              <div className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">
+                Severity reset audit
+              </div>
+              <div className="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-4">
+                <Input
+                  value={harpAuditActorFilter}
+                  onChange={(e) => setHarpAuditActorFilter(e.target.value)}
+                  placeholder="actor (exact)"
+                />
+                <Select
+                  value={harpAuditAllowedFilter}
+                  onValueChange={(v) => setHarpAuditAllowedFilter(v)}
+                >
+                  <SelectOption value="all">all</SelectOption>
+                  <SelectOption value="allowed">allowed</SelectOption>
+                  <SelectOption value="denied">denied</SelectOption>
+                </Select>
+                <Input
+                  value={harpAuditKeyFilter}
+                  onChange={(e) => setHarpAuditKeyFilter(e.target.value)}
+                  placeholder="filter key"
+                />
+                <Select
+                  value={harpAuditSinceWindow}
+                  onValueChange={(v) => setHarpAuditSinceWindow(v)}
+                >
+                  <SelectOption value="all">all time</SelectOption>
+                  <SelectOption value="1h">last 1h</SelectOption>
+                  <SelectOption value="24h">last 24h</SelectOption>
+                  <SelectOption value="7d">last 7d</SelectOption>
+                </Select>
+              </div>
+              <div className="mb-2 w-48">
+                <Select
+                  value={harpAuditSort}
+                  onValueChange={(v) => setHarpAuditSort(v as "newest" | "oldest")}
+                >
+                  <SelectOption value="newest">newest</SelectOption>
+                  <SelectOption value="oldest">oldest</SelectOption>
+                </Select>
+              </div>
+              <div className="mb-2 flex items-center gap-2">
+                <Badge tone="secondary">reason visibility: {harpResetAuditReasonVisibility}</Badge>
+                {harpResetAuditStats?.compaction_health && (
+                  <Badge
+                    tone={
+                      (harpResetAuditStats.compaction_health.active_warning_count || 0) > 0
+                        ? "warning"
+                        : "success"
+                    }
+                  >
+                    active warnings {harpResetAuditStats.compaction_health.active_warning_count || 0}
+                  </Badge>
+                )}
+                {harpResetAuditStats?.compaction_health?.last_webhook_delivery && (
+                  <Badge
+                    tone={
+                      harpResetAuditStats.compaction_health.last_webhook_delivery.sent
+                        ? "success"
+                        : harpResetAuditStats.compaction_health.last_webhook_delivery.skipped_cooldown
+                          ? "secondary"
+                          : "warning"
+                    }
+                  >
+                    webhook{" "}
+                    {harpResetAuditStats.compaction_health.last_webhook_delivery.sent
+                      ? "sent"
+                      : harpResetAuditStats.compaction_health.last_webhook_delivery.skipped_cooldown
+                        ? "cooldown"
+                        : "not sent"}
+                  </Badge>
+                )}
+                {harpResetAuditStats?.compaction_health?.webhook_slo_anomalies &&
+                  harpResetAuditStats.compaction_health.webhook_slo_anomalies.length > 0 && (
+                    <Badge tone="warning">
+                      anomalies {harpResetAuditStats.compaction_health.webhook_slo_anomalies.join(",")}
+                    </Badge>
+                  )}
+                {harpResetAuditStats?.compaction_health?.webhook_muted_until &&
+                  harpResetAuditStats.compaction_health.webhook_muted_until * 1000 > harpClock && (
+                    <Badge tone="destructive">
+                      webhook muted until{" "}
+                      {new Date(harpResetAuditStats.compaction_health.webhook_muted_until * 1000).toLocaleTimeString()}
+                    </Badge>
+                  )}
+                <Button
+                  size="sm"
+                  ghost
+                  disabled={!harpResetAuditHasMore}
+                  onClick={() => loadHarpResetAudit(true)}
+                >
+                  Load more
+                </Button>
+                <Button size="sm" ghost disabled={harpCompactingAudit} onClick={compactResetAudit}>
+                  {harpCompactingAudit ? "Compacting…" : "Compact audit"}
+                </Button>
+                <Button size="sm" ghost onClick={unmuteCompactionWebhook}>
+                  Unmute webhook
+                </Button>
+              </div>
+              {harpResetAuditStats && (
+                <div className="mb-2 text-xs text-muted-foreground">
+                  total={harpResetAuditStats.totals.total} · allowed={harpResetAuditStats.totals.allowed} · denied=
+                  {harpResetAuditStats.totals.denied} · unique actors={harpResetAuditStats.totals.unique_actors} ·
+                  buckets={harpResetAuditStats.series?.length ?? 0}
+                  {harpResetAuditStats.compaction_health?.warnings?.length
+                    ? ` · compaction warnings=${harpResetAuditStats.compaction_health.warnings.join(",")}`
+                    : ""}
+                  {harpResetAuditStats.compaction_health?.webhook_slo
+                    ? ` · webhook success=${Math.round((harpResetAuditStats.compaction_health.webhook_slo.success_rate || 0) * 100)}% · p95=${harpResetAuditStats.compaction_health.webhook_slo.p95_latency_ms ?? "-"}ms · streak=${harpResetAuditStats.compaction_health.webhook_slo.failure_streak ?? 0}`
+                    : ""}
+                  {harpResetAuditStats.compaction_health?.webhook_slo_windows
+                    ? ` · success(1h/24h)=${Math.round((harpResetAuditStats.compaction_health.webhook_slo_windows.last_1h.success_rate || 0) * 100)}%/${Math.round((harpResetAuditStats.compaction_health.webhook_slo_windows.last_24h.success_rate || 0) * 100)}%`
+                    : ""}
+                  {typeof harpResetAuditStats.compaction_health?.unmute_count_24h === "number"
+                    ? ` · unmute24h=${harpResetAuditStats.compaction_health.unmute_count_24h} · unmute_rate=${Math.round((harpResetAuditStats.compaction_health.manual_unmute_rate || 0) * 100)}%`
+                    : ""}
+                </div>
+              )}
+              {harpResetAuditStats?.compaction_health?.webhook_slo_windows && (
+                <div className="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-2 text-xs">
+                  <div className="rounded border border-border p-2">
+                    <div className="text-muted-foreground">Webhook success-rate trend (1h,24h,all)</div>
+                    <div className="font-mono">
+                      {sparkline([
+                        (harpResetAuditStats.compaction_health.webhook_slo_windows.last_1h.success_rate || 0) * 100,
+                        (harpResetAuditStats.compaction_health.webhook_slo_windows.last_24h.success_rate || 0) * 100,
+                        (harpResetAuditStats.compaction_health.webhook_slo_windows.all_time.success_rate || 0) * 100,
+                      ])}{" "}
+                      {Math.round(
+                        (harpResetAuditStats.compaction_health.webhook_slo_windows.last_1h.success_rate || 0) * 100,
+                      )}
+                      {harpResetAuditStats?.compaction_health?.webhook_anomaly_state && (
+                        <div className="mb-2 text-xs text-muted-foreground">
+                          {Object.entries(harpResetAuditStats.compaction_health.webhook_anomaly_state).map(([code, info]) => (
+                            <span key={code} className="mr-3">
+                              {code}: count={info.count} first={new Date(info.first_seen * 1000).toLocaleTimeString()} last=
+                              {new Date(info.last_seen * 1000).toLocaleTimeString()}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      % /
+                      {Math.round(
+                        (harpResetAuditStats.compaction_health.webhook_slo_windows.last_24h.success_rate || 0) * 100,
+                      )}
+                      % /{" "}
+                      {Math.round(
+                        (harpResetAuditStats.compaction_health.webhook_slo_windows.all_time.success_rate || 0) * 100,
+                      )}
+                      %
+                    </div>
+                  </div>
+                  <div className="rounded border border-border p-2">
+                    <div className="text-muted-foreground">Webhook p95 latency trend (1h,24h,all)</div>
+                    <div className="font-mono">
+                      {sparkline([
+                        harpResetAuditStats.compaction_health.webhook_slo_windows.last_1h.p95_latency_ms || 0,
+                        harpResetAuditStats.compaction_health.webhook_slo_windows.last_24h.p95_latency_ms || 0,
+                        harpResetAuditStats.compaction_health.webhook_slo_windows.all_time.p95_latency_ms || 0,
+                      ])}{" "}
+                      {harpResetAuditStats.compaction_health.webhook_slo_windows.last_1h.p95_latency_ms ?? "-"}ms /
+                      {harpResetAuditStats.compaction_health.webhook_slo_windows.last_24h.p95_latency_ms ?? "-"}ms /{" "}
+                      {harpResetAuditStats.compaction_health.webhook_slo_windows.all_time.p95_latency_ms ?? "-"}ms
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div className="mb-2 space-y-1 text-xs font-mono text-muted-foreground">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <Input
+                      value={harpCompactionActorFilter}
+                      onChange={(e) => setHarpCompactionActorFilter(e.target.value)}
+                      placeholder="compaction actor_tag"
+                    />
+                    <Select
+                      value={harpCompactionTriggerFilter}
+                      onValueChange={(v) => setHarpCompactionTriggerFilter(v)}
+                    >
+                      <SelectOption value="all">all triggers</SelectOption>
+                      <SelectOption value="auto">auto</SelectOption>
+                      <SelectOption value="manual">manual</SelectOption>
+                    </Select>
+                    <Select
+                      value={harpCompactionSinceWindow}
+                      onValueChange={(v) => setHarpCompactionSinceWindow(v)}
+                    >
+                      <SelectOption value="1h">last 1h</SelectOption>
+                      <SelectOption value="24h">last 24h</SelectOption>
+                      <SelectOption value="7d">last 7d</SelectOption>
+                    </Select>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <Select
+                      value={harpWebhookStatusFilter}
+                      onValueChange={(v) => setHarpWebhookStatusFilter(v)}
+                    >
+                      <SelectOption value="all">webhook all</SelectOption>
+                      <SelectOption value="sent">webhook sent</SelectOption>
+                      <SelectOption value="failed">webhook failed</SelectOption>
+                    </Select>
+                    <Input
+                      value={harpWebhookLatencyMinFilter}
+                      onChange={(e) => setHarpWebhookLatencyMinFilter(e.target.value)}
+                      placeholder="min latency ms"
+                    />
+                    <Input
+                      value={harpWebhookErrorFilter}
+                      onChange={(e) => setHarpWebhookErrorFilter(e.target.value)}
+                      placeholder="error contains"
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <Select
+                      value={harpUnmuteWasMutedFilter}
+                      onValueChange={(v) => setHarpUnmuteWasMutedFilter(v)}
+                    >
+                      <SelectOption value="all">unmute all</SelectOption>
+                      <SelectOption value="true">was muted=true</SelectOption>
+                      <SelectOption value="false">was muted=false</SelectOption>
+                    </Select>
+                    <Input
+                      value={harpUnmuteReasonFilter}
+                      onChange={(e) => setHarpUnmuteReasonFilter(e.target.value)}
+                      placeholder="unmute reason contains"
+                    />
+                    <Select
+                      value={harpUnmuteSortBy}
+                      onValueChange={(v) => setHarpUnmuteSortBy(v as "timestamp" | "actor_tag" | "reason")}
+                    >
+                      <SelectOption value="timestamp">unmute sort: timestamp</SelectOption>
+                      <SelectOption value="actor_tag">unmute sort: actor_tag</SelectOption>
+                      <SelectOption value="reason">unmute sort: reason</SelectOption>
+                    </Select>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <Input
+                      value={harpVerifierUnlockId}
+                      onChange={(e) => setHarpVerifierUnlockId(e.target.value)}
+                      placeholder="verifier id to unlock"
+                    />
+                    <Button size="sm" ghost onClick={unlockVerifier}>
+                      Unlock verifier
+                    </Button>
+                    <div className="flex items-center gap-2">
+                      <Select
+                        value={harpVerifyLockBundleFormat}
+                        onValueChange={(v) => setHarpVerifyLockBundleFormat(v as "json" | "csv")}
+                      >
+                        <SelectOption value="json">lock bundle json</SelectOption>
+                        <SelectOption value="csv">lock bundle csv</SelectOption>
+                      </Select>
+                      <Button size="sm" ghost onClick={downloadVerifyLockBundle}>
+                        Export lock bundle
+                      </Button>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Select
+                        value={harpVerifyLockAlertsExportFormat}
+                        onValueChange={(v) => setHarpVerifyLockAlertsExportFormat(v as "json" | "csv")}
+                      >
+                        <SelectOption value="json">lock alerts json</SelectOption>
+                        <SelectOption value="csv">lock alerts csv</SelectOption>
+                      </Select>
+                      <Button size="sm" ghost onClick={downloadVerifyLockAlerts}>
+                        Export lock alerts
+                      </Button>
+                    </div>
+                    <Select
+                      value={harpVerifyLockAlertsActiveFilter}
+                      onValueChange={(v) => setHarpVerifyLockAlertsActiveFilter(v)}
+                    >
+                      <SelectOption value="all">lock alerts: all</SelectOption>
+                      <SelectOption value="on">lock alerts: active only</SelectOption>
+                      <SelectOption value="off">lock alerts: cleared only</SelectOption>
+                    </Select>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <Select
+                      value={harpCompactionExportStream}
+                      onValueChange={(v) =>
+                        setHarpCompactionExportStream(v as "alerts" | "webhook" | "unmute" | "verify_unlock")
+                      }
+                    >
+                      <SelectOption value="alerts">export alerts</SelectOption>
+                      <SelectOption value="webhook">export webhook</SelectOption>
+                      <SelectOption value="unmute">export unmute</SelectOption>
+                      <SelectOption value="verify_unlock">export verify unlock</SelectOption>
+                    </Select>
+                    <Select
+                      value={harpCompactionExportFormat}
+                      onValueChange={(v) => setHarpCompactionExportFormat(v as "json" | "csv")}
+                    >
+                      <SelectOption value="json">json</SelectOption>
+                      <SelectOption value="csv">csv</SelectOption>
+                    </Select>
+                    <Button size="sm" ghost onClick={downloadCompactionExport}>
+                      <Download className="h-4 w-4" />
+                      Export
+                    </Button>
+                  </div>
+                  {harpCompactionAudit.map((row, idx) => (
+                    <div key={`${row.timestamp}-${idx}`}>
+                      compact {row.trigger} · {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · actor=
+                      {row.actor_tag || "-"} · {row.before}{"→"}{row.after} rows · partitions={row.partitions}
+                    </div>
+                  ))}
+                  {harpCompactionAlerts.map((row, idx) => (
+                    <div key={`alert-${row.timestamp}-${idx}`}>
+                      <Badge
+                        tone={
+                          (row.warning_details || []).some((x) => x.severity === "critical")
+                            ? "destructive"
+                            : (row.warning_details || []).some((x) => x.severity === "warn")
+                              ? "warning"
+                              : "secondary"
+                        }
+                      >
+                        {(row.warning_details || []).some((x) => x.severity === "critical")
+                          ? "critical"
+                          : (row.warning_details || []).some((x) => x.severity === "warn")
+                            ? "warn"
+                            : "info"}
+                      </Badge>{" "}
+                      alert {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · warnings=
+                      {(row.warnings || []).join(",") || "none"} · rows={row.rows} · partitions={row.partitions}
+                      {row.high_severity ? " · high" : ""} · severity=
+                      {(row.warning_details || []).map((x) => `${x.code}:${x.severity}`).join(",")}
+                    </div>
+                  ))}
+                  {harpCompactionWebhookAudit
+                    .filter((row) => {
+                      if (harpWebhookStatusFilter === "sent" && !row.sent) return false;
+                      if (harpWebhookStatusFilter === "failed" && row.sent) return false;
+                      if (harpWebhookLatencyMinFilter.trim()) {
+                        const minLatency = Number.parseInt(harpWebhookLatencyMinFilter.trim(), 10);
+                        if (Number.isFinite(minLatency) && minLatency > 0) {
+                          if ((row.latency_ms ?? 0) < minLatency) return false;
+                        }
+                      }
+                      if (
+                        harpWebhookErrorFilter.trim() &&
+                        !(row.last_error || "")
+                          .toLowerCase()
+                          .includes(harpWebhookErrorFilter.trim().toLowerCase())
+                      ) {
+                        return false;
+                      }
+                      return true;
+                    })
+                    .map((row, idx) => (
+                    <div key={`webhook-${row.timestamp}-${idx}`}>
+                      webhook {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} ·{" "}
+                      {row.sent ? "sent" : "failed"} · attempts={row.attempts} · latency=
+                      {row.latency_ms != null ? `${row.latency_ms}ms` : "-"}
+                      {row.last_error ? ` · error=${row.last_error}` : ""}
+                    </div>
+                  ))}
+                  {harpUnmuteAudit.map((row, idx) => (
+                    <div key={`unmute-${row.timestamp}-${idx}`}>
+                      unmute {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · actor=
+                      {row.actor_tag || "-"} · was_muted={row.was_muted ? "true" : "false"} · reason=
+                      {row.reason || "-"}
+                    </div>
+                  ))}
+                  {harpVerifyAudit.map((row, idx) => (
+                    <div key={`verify-${row.timestamp}-${idx}`}>
+                      verify {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · stream={row.stream} · ok=
+                      {row.ok ? "true" : "false"} · verifier={row.verifier_id || "-"} · nonce={row.nonce || "-"}
+                    </div>
+                  ))}
+                  {Object.keys(harpVerifyDuplicateHeatmap).length > 0 && (
+                    <div>
+                      verify duplicate heatmap:{" "}
+                      {Object.entries(harpVerifyDuplicateHeatmap)
+                        .map(
+                          ([k, v]) =>
+                            `${k}(10m:${v.last_10m},1h:${v.last_1h},24h:${v.last_24h})`,
+                        )
+                        .join(" · ")}
+                    </div>
+                  )}
+                  {harpVerifierUnlockAudit.map((row, idx) => (
+                    <div key={`verify-unlock-${row.timestamp}-${idx}`}>
+                      verify unlock {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · verifier=
+                      {row.verifier_id || "-"} · actor={row.actor_tag || "-"} · was_locked=
+                      {row.was_locked ? "true" : "false"}
+                    </div>
+                  ))}
+                  {harpVerifyLockAudit.map((row, idx) => (
+                    <div key={`verify-lock-${row.timestamp}-${idx}`}>
+                      verify lock {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · action={row.action} ·
+                      verifier={row.verifier_id || "-"}
+                      {row.locked_until ? ` · until=${new Date(row.locked_until * 1000).toLocaleTimeString()}` : ""}
+                    </div>
+                  ))}
+                  {harpVerifyNonceDuplicateCount > 0 && (
+                    <div>
+                      verify nonce duplicates={harpVerifyNonceDuplicateCount}
+                      {Object.keys(harpVerifyNonceDuplicateByStream).length > 0
+                        ? ` · by stream: ${Object.entries(harpVerifyNonceDuplicateByStream)
+                            .map(([k, v]) => `${k}:${v}`)
+                            .join(", ")}`
+                        : ""}
+                    </div>
+                  )}
+                  {Object.keys(harpVerifyActiveLocks).length > 0 && (
+                    <div>
+                      verifier locks:{" "}
+                      {Object.entries(harpVerifyActiveLocks)
+                        .map(([k, v]) => `${k}→${new Date(v * 1000).toLocaleTimeString()}`)
+                        .join(", ")}
+                    </div>
+                  )}
+                  {harpVerifyLockSummary && (
+                    <div>
+                      lock summary: locked={harpVerifyLockSummary.locked_verifier_count}
+                      {harpVerifyLockSummary.soonest_unlock_at
+                        ? ` · soonest unlock=${new Date(harpVerifyLockSummary.soonest_unlock_at * 1000).toLocaleTimeString()}`
+                        : ""}
+                      {` · lock entries 24h=${harpVerifyLockSummary.lock_entries_24h}`}
+                      {harpVerifyLockSummary.lock_entries_windows
+                        ? ` · windows(1h/24h/7d)=${harpVerifyLockSummary.lock_entries_windows.last_1h}/${harpVerifyLockSummary.lock_entries_windows.last_24h}/${harpVerifyLockSummary.lock_entries_windows.last_7d}`
+                        : ""}
+                      {typeof harpVerifyLockSummary.active_locks_alert === "boolean"
+                        ? ` · active-lock-alert=${harpVerifyLockSummary.active_locks_alert ? "on" : "off"}`
+                        : ""}
+                      {harpVerifyLockSummary.active_locks_threshold
+                        ? ` · threshold=${harpVerifyLockSummary.active_locks_threshold}`
+                        : ""}
+                      {harpVerifyLockSummary.active_locks_alert &&
+                      typeof harpVerifyLockSummary.active_locks_alert_dwell_seconds === "number"
+                        ? ` · dwell=${Math.round(harpVerifyLockSummary.active_locks_alert_dwell_seconds)}s`
+                        : ""}
+                      {harpVerifyLockSummary.active_locks_alert_dwell_severity &&
+                      harpVerifyLockSummary.active_locks_alert_dwell_severity !== "none"
+                        ? ` · dwell-severity=${harpVerifyLockSummary.active_locks_alert_dwell_severity}`
+                        : ""}
+                    </div>
+                  )}
+                  {harpVerifyLockNotifyMetrics && (
+                    <div>
+                      lock notify metrics: attempted={harpVerifyLockNotifyMetrics.attempted} · sent=
+                      {harpVerifyLockNotifyMetrics.sent} · failed={harpVerifyLockNotifyMetrics.failed} · success=
+                      {Math.round((harpVerifyLockNotifyMetrics.success_rate || 0) * 100)}% · p95=
+                      {harpVerifyLockNotifyMetrics.p95_latency_ms ?? "-"}ms
+                      {harpVerifyLockNotifyMetrics.windows
+                        ? ` · windows(1h/24h success)=${Math.round((harpVerifyLockNotifyMetrics.windows.last_1h.success_rate || 0) * 100)}%/${Math.round((harpVerifyLockNotifyMetrics.windows.last_24h.success_rate || 0) * 100)}%`
+                        : ""}
+                    </div>
+                  )}
+                  {harpVerifyLockAlerts.map((row, idx) => (
+                    <div key={`verify-lock-alert-${row.timestamp}-${idx}`}>
+                      verify lock alert {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · active=
+                      {row.active ? "true" : "false"} · locked={row.locked_verifier_count} · threshold=
+                      {row.threshold}
+                    </div>
+                  ))}
+                  {harpCompactionAudit.length === 0 &&
+                    harpCompactionAlerts.length === 0 &&
+                    harpCompactionWebhookAudit.length === 0 &&
+                    harpUnmuteAudit.length === 0 &&
+                    harpVerifyAudit.length === 0 &&
+                    harpVerifyLockAlerts.length === 0 && (
+                    <div>No compaction activity.</div>
+                  )}
+                </div>
+              <div className="space-y-1 text-xs font-mono text-muted-foreground">
+                {harpResetAudit.filter((row) => {
+                  if (harpAuditKeyFilter && !(row.key || "").includes(harpAuditKeyFilter)) return false;
+                  return true;
+                }).length === 0 && <div>No reset audit entries.</div>}
+                {harpResetAudit
+                  .filter((row) => {
+                    if (harpAuditKeyFilter && !(row.key || "").includes(harpAuditKeyFilter)) return false;
+                    return true;
+                  })
+                  .map((row, idx) => (
+                  <div key={`${row.timestamp}-${idx}`}>
+                    {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} ·{" "}
+                    {row.allowed ? "allowed" : "denied"} · actor={row.actor_tag || "-"} · scope={row.scope}
+                    {row.key ? `/${row.key}` : ""} · removed={row.removed} · reason={row.reason || "-"}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone={harpAutoRefresh ? "success" : "secondary"}>
+                auto-refresh {harpAutoRefresh ? "on" : "off"}
+              </Badge>
+              <Button size="sm" ghost onClick={() => setHarpAutoRefresh((v) => !v)}>
+                Toggle auto-refresh
+              </Button>
+              <Badge tone={harpLint?.ok ? "success" : "warning"}>
+                lint {harpLint?.ok ? "ok" : "needs attention"}
+              </Badge>
+              {harpMetrics?.reliability?.deltas?.last_1h_vs_prev_1h?.severity && (
+                <Badge tone="secondary">
+                  severity {harpMetrics.reliability.deltas.last_1h_vs_prev_1h.severity}
+                </Badge>
+              )}
+              {harpVerifyLockSummary?.active_locks_alert && (
+                <Badge tone={lockAlertSeverityTone(harpVerifyLockSummary.active_locks_alert_dwell_severity)}>
+                  active-lock alert ({harpVerifyLockSummary.locked_verifier_count}
+                  {harpVerifyLockSummary.active_locks_threshold
+                    ? `>${harpVerifyLockSummary.active_locks_threshold}`
+                    : ""}
+                  {typeof harpVerifyLockSummary.active_locks_alert_dwell_seconds === "number"
+                    ? `, ${Math.round(harpVerifyLockSummary.active_locks_alert_dwell_seconds)}s`
+                    : ""}
+                  {harpVerifyLockSummary.active_locks_alert_dwell_severity &&
+                  harpVerifyLockSummary.active_locks_alert_dwell_severity !== "none"
+                    ? `, ${harpVerifyLockSummary.active_locks_alert_dwell_severity}`
+                    : ""}
+                  )
+                </Badge>
+              )}
+              {harpCursor && (
+                <span className="text-xs text-muted-foreground font-mono">
+                  cursor: {harpCursor.slice(0, 12)}
+                </span>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                ghost
+                prefix={<Download className="h-3.5 w-3.5" />}
+                onClick={() => void downloadHarpExport("json")}
+              >
+                Export JSON
+              </Button>
+              <Button
+                size="sm"
+                ghost
+                prefix={<Download className="h-3.5 w-3.5" />}
+                onClick={() => void downloadHarpExport("csv")}
+              >
+                Export CSV
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <div className="rounded border border-border p-3">
+                <div className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">
+                  Recent decisions
+                </div>
+                <div className="max-h-44 overflow-auto space-y-1 text-xs font-mono">
+                  {(harpStatus?.history ?? []).slice(-8).map((row, idx) => (
+                    <div key={`${row.timestamp}-${row.state}-${idx}`} className="text-muted-foreground">
+                      {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · {row.state}
+                      {row.provider ? ` · ${row.provider}` : ""}
+                      {row.model ? `/${row.model}` : ""}
+                    </div>
+                  ))}
+                  {!harpStatus?.history?.length && (
+                    <div className="text-muted-foreground">No decisions yet.</div>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded border border-border p-3">
+                <div className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">
+                  Alert audit trail
+                </div>
+                <div className="max-h-44 overflow-auto space-y-1 text-xs font-mono">
+                  {(harpStatus?.alerts ?? []).slice(-8).map((row, idx) => (
+                    <div key={`${row.timestamp}-${row.audit_id ?? idx}`} className="text-muted-foreground">
+                      {new Date((row.timestamp || 0) * 1000).toLocaleTimeString()} · {row.severity}
+                      {row.audit_id ? ` · ${row.audit_id.slice(0, 8)}` : ""}
+                      {row.webhook_status ? ` · webhook:${row.webhook_status}` : ""}
+                    </div>
+                  ))}
+                  {!harpStatus?.alerts?.length && (
+                    <div className="text-muted-foreground">No alerts yet.</div>
+                  )}
+                </div>
+              </div>
             </div>
           </CardContent>
         </Card>

@@ -14,6 +14,201 @@ function readBasePath(): string {
   return withLead.replace(/\/+$/, "");
 }
 
+export interface HarpStatusMetricsResponse {
+  window_hours: number;
+  bucket: "1m" | "5m" | "1h" | string;
+  bucket_seconds: number;
+  series: Array<{
+    bucket_start: number;
+    attempted: number;
+    sent: number;
+    failed: number;
+    success_ratio: number;
+  }>;
+  reliability?: {
+    failure_streak: {
+      count: number;
+      max: number;
+      p95: number;
+    };
+    windows?: {
+      last_1h: {
+        count: number;
+        max: number;
+        p95: number;
+      };
+      last_24h: {
+        count: number;
+        max: number;
+        p95: number;
+      };
+    };
+    deltas?: {
+      last_1h_vs_prev_1h: {
+        sent_delta: number;
+        failed_delta: number;
+        attempted_delta: number;
+        warning_threshold?: number;
+        warning?: boolean;
+        severity_thresholds?: {
+          info: number;
+          warn: number;
+          critical: number;
+        };
+        severity?: "none" | "info" | "warn" | "critical" | string;
+        severity_raw?: "none" | "info" | "warn" | "critical" | string;
+        severity_cooldown_seconds?: number;
+        severity_state_key?: string;
+        breach_counters?: {
+          info: number;
+          warn: number;
+          critical: number;
+        };
+        last_breach_ts?: {
+          info: number;
+          warn: number;
+          critical: number;
+        };
+      };
+    };
+  };
+}
+
+export interface HarpStatusLintResponse {
+  ok: boolean;
+  strict?: boolean;
+  escalated_warnings?: number;
+  issues: string[];
+  warnings: string[];
+  reason_codes?: string[];
+}
+
+export interface HarpStatusLintHistoryResponse {
+  history: Array<{
+    timestamp: number;
+    ok: boolean;
+    strict: boolean;
+    issues_count: number;
+    warnings_count: number;
+    reason_codes?: string[];
+  }>;
+}
+
+export interface HarpSeverityResetAuditResponse {
+  audit: Array<{
+    audit_id?: string;
+    timestamp: number;
+    allowed: boolean;
+    actor_tag: string;
+    reason: string;
+    scope: string;
+    key: string;
+    removed: number;
+    deny_reason_hit?: boolean;
+    reason_masked?: boolean;
+  }>;
+  sort?: string;
+  sort_by?: string;
+  limit?: number;
+  has_more?: boolean;
+  total_estimate?: number;
+  next_cursor?: number | null;
+  next_cursor_token?: string | null;
+  reason_visible?: boolean;
+  reason_visibility?: "full" | "partial" | "masked";
+}
+
+export interface HarpSeverityResetAuditStatsResponse {
+  window_hours: number;
+  window_bucket?: "1m" | "5m" | "1h";
+  since: number;
+  totals: {
+    total: number;
+    allowed: number;
+    denied: number;
+    unique_actors: number;
+  };
+  top_actors: Array<{
+    actor_tag: string;
+    total: number;
+    allowed: number;
+    denied: number;
+  }>;
+  series?: Array<{
+    timestamp: number;
+    total: number;
+    allowed: number;
+    denied: number;
+  }>;
+  compaction_health?: {
+    warnings: string[];
+    warning_details?: Array<{ code: string; severity: string }>;
+    active_warning_count?: number;
+    last_compact_ts: number | null;
+    rows: number;
+    partitions: number;
+    last_webhook_delivery?: {
+      timestamp: number;
+      sent: boolean;
+      skipped_cooldown?: boolean;
+      skipped_backoff?: boolean;
+      warnings: string[];
+      attempts?: number;
+      last_error?: string;
+      latency_ms?: number | null;
+    } | null;
+    webhook_muted_until?: number | null;
+    backoff_transition?: {
+      timestamp: number;
+      from: "normal" | "muted";
+      to: "normal" | "muted";
+      muted_until?: number | null;
+    } | null;
+    webhook_slo?: {
+      attempted: number;
+      sent: number;
+      failed: number;
+      success_rate: number;
+      p95_latency_ms: number | null;
+      failure_streak: number;
+    };
+    webhook_slo_windows?: {
+      all_time: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_rate: number;
+        p95_latency_ms: number | null;
+        failure_streak: number;
+      };
+      last_1h: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_rate: number;
+        p95_latency_ms: number | null;
+        failure_streak: number;
+      };
+      last_24h: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_rate: number;
+        p95_latency_ms: number | null;
+        failure_streak: number;
+      };
+    };
+    webhook_slo_anomalies?: string[];
+    webhook_anomaly_state?: Record<
+      string,
+      { count: number; first_seen: number; last_seen: number; active?: boolean }
+    >;
+    unmute_count_24h?: number;
+    manual_unmute_rate?: number;
+    top_unmute_actors_24h?: Array<{ actor_tag: string; count: number }>;
+  };
+}
+
 export const HERMES_BASE_PATH = readBasePath();
 const BASE = HERMES_BASE_PATH;
 
@@ -302,6 +497,760 @@ function profileQuery(profile?: string): string {
 
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  getHarpStatus: (params?: { tail?: number; since?: number; sinceId?: string; severity?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.tail != null) q.set("tail", String(params.tail));
+    if (params?.since != null) q.set("since", String(params.since));
+    if (params?.sinceId) q.set("since_id", params.sinceId);
+    if (params?.severity) q.set("severity", params.severity);
+    const suffix = q.toString();
+    return fetchJSON<HarpStatusResponse>(`/api/harp-status${suffix ? `?${suffix}` : ""}`);
+  },
+  getHarpStatusExport: async (params?: {
+    format?: "json" | "csv";
+    columns?: "minimal" | "full";
+    tail?: number;
+    since?: number;
+    sinceId?: string;
+    severity?: string;
+  }) => {
+    const q = new URLSearchParams();
+    q.set("format", params?.format ?? "json");
+    if (params?.columns) q.set("columns", params.columns);
+    if (params?.tail != null) q.set("tail", String(params.tail));
+    if (params?.since != null) q.set("since", String(params.since));
+    if (params?.sinceId) q.set("since_id", params.sinceId);
+    if (params?.severity) q.set("severity", params.severity);
+    const resp = await authedFetch(`/api/harp-status/export?${q.toString()}`);
+    if (!resp.ok) {
+      throw new Error(`HARP export failed: HTTP ${resp.status}`);
+    }
+    return {
+      blob: await resp.blob(),
+      filename:
+        resp.headers
+          .get("content-disposition")
+          ?.match(/filename="?([^";]+)"?/)?.[1] ?? `harp-status.${params?.format ?? "json"}`,
+    };
+  },
+  getHarpStatusMetrics: (
+    windowHours = 24,
+    bucket: "1m" | "5m" | "1h" = "1h",
+    failedDeltaWarningThreshold = 0,
+    failedDeltaInfoThreshold = 0,
+    failedDeltaWarnThreshold = 0,
+    failedDeltaCriticalThreshold = 0,
+    severityCooldownSeconds = 0,
+    severityStateKey = "default",
+  ) =>
+    fetchJSON<HarpStatusMetricsResponse>(
+      `/api/harp-status/metrics?window_hours=${encodeURIComponent(String(windowHours))}&bucket=${encodeURIComponent(bucket)}&failed_delta_warning_threshold=${encodeURIComponent(String(failedDeltaWarningThreshold))}&failed_delta_info_threshold=${encodeURIComponent(String(failedDeltaInfoThreshold))}&failed_delta_warn_threshold=${encodeURIComponent(String(failedDeltaWarnThreshold))}&failed_delta_critical_threshold=${encodeURIComponent(String(failedDeltaCriticalThreshold))}&severity_cooldown_seconds=${encodeURIComponent(String(severityCooldownSeconds))}&severity_state_key=${encodeURIComponent(severityStateKey)}`,
+    ),
+  getHarpStatusLint: (strict = false) =>
+    fetchJSON<HarpStatusLintResponse>(`/api/harp-status/lint?strict=${strict ? "true" : "false"}`),
+  getHarpStatusLintHistory: (tail = 20) =>
+    fetchJSON<HarpStatusLintHistoryResponse>(
+      `/api/harp-status/lint-history?tail=${encodeURIComponent(String(tail))}`,
+    ),
+  getHarpSeverityResetAudit: (
+    tail = 20,
+    filters?: {
+      actor?: string;
+      allowed?: boolean;
+      since?: number;
+      sort?: "newest" | "oldest";
+      sortBy?: "timestamp" | "actor_tag" | "reason";
+      cursor?: number;
+      cursorToken?: string;
+      viewerTag?: string;
+      limit?: number;
+    },
+  ) =>
+    fetchJSON<HarpSeverityResetAuditResponse>(
+      `/api/harp-status/severity-reset-audit?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        filters?.limit != null ? `limit=${encodeURIComponent(String(filters.limit))}` : "",
+        filters?.sort ? `sort=${encodeURIComponent(filters.sort)}` : "",
+        filters?.cursor != null ? `cursor=${encodeURIComponent(String(filters.cursor))}` : "",
+        filters?.cursorToken ? `cursor_token=${encodeURIComponent(filters.cursorToken)}` : "",
+        filters?.actor ? `actor=${encodeURIComponent(filters.actor)}` : "",
+        typeof filters?.allowed === "boolean"
+          ? `allowed=${filters.allowed ? "true" : "false"}`
+          : "",
+        filters?.since != null ? `since=${encodeURIComponent(String(filters.since))}` : "",
+        filters?.viewerTag ? `viewer_tag=${encodeURIComponent(filters.viewerTag)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  getHarpSeverityResetAuditStats: (
+    windowHours = 24,
+    actor?: string,
+    options?: { actorTag?: string; windowBucket?: "1m" | "5m" | "1h" },
+  ) =>
+    fetchJSON<HarpSeverityResetAuditStatsResponse>(
+      `/api/harp-status/severity-reset-audit/stats?${[
+        `window_hours=${encodeURIComponent(String(windowHours))}`,
+        actor ? `actor=${encodeURIComponent(actor)}` : "",
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.windowBucket ? `window_bucket=${encodeURIComponent(options.windowBucket)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  compactHarpSeverityResetAudit: (dryRun = false, actorTag?: string) =>
+    fetchJSON<{
+      ok: boolean;
+      dry_run: boolean;
+      before: number;
+      after: number;
+      partitions: number;
+      compaction_health?: {
+        warnings: string[];
+        warning_details?: Array<{ code: string; severity: string }>;
+        active_warning_count?: number;
+        last_compact_ts: number | null;
+        rows: number;
+        partitions: number;
+        last_webhook_delivery?: {
+          timestamp: number;
+          sent: boolean;
+          skipped_cooldown?: boolean;
+          skipped_backoff?: boolean;
+          warnings: string[];
+          attempts?: number;
+          last_error?: string;
+          latency_ms?: number | null;
+        } | null;
+        webhook_muted_until?: number | null;
+        backoff_transition?: {
+          timestamp: number;
+          from: "normal" | "muted";
+          to: "normal" | "muted";
+          muted_until?: number | null;
+        } | null;
+        webhook_slo?: {
+          attempted: number;
+          sent: number;
+          failed: number;
+          success_rate: number;
+          p95_latency_ms: number | null;
+          failure_streak: number;
+        };
+        webhook_slo_windows?: {
+          all_time: {
+            attempted: number;
+            sent: number;
+            failed: number;
+            success_rate: number;
+            p95_latency_ms: number | null;
+            failure_streak: number;
+          };
+          last_1h: {
+            attempted: number;
+            sent: number;
+            failed: number;
+            success_rate: number;
+            p95_latency_ms: number | null;
+            failure_streak: number;
+          };
+          last_24h: {
+            attempted: number;
+            sent: number;
+            failed: number;
+            success_rate: number;
+            p95_latency_ms: number | null;
+            failure_streak: number;
+          };
+        };
+        webhook_slo_anomalies?: string[];
+        webhook_anomaly_state?: Record<
+          string,
+          { count: number; first_seen: number; last_seen: number; active?: boolean }
+        >;
+        unmute_count_24h?: number;
+        manual_unmute_rate?: number;
+        top_unmute_actors_24h?: Array<{ actor_tag: string; count: number }>;
+      };
+    }>(
+      `/api/harp-status/severity-reset-audit/compact?${[
+        `dry_run=${dryRun ? "true" : "false"}`,
+        actorTag ? `actor_tag=${encodeURIComponent(actorTag)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+      { method: "POST" },
+    ),
+  getHarpSeverityResetCompactionAudit: (
+    tail = 20,
+    options?: { actorTag?: string; trigger?: "auto" | "manual"; since?: number },
+  ) =>
+    fetchJSON<{
+      audit: Array<{
+        timestamp: number;
+        trigger: string;
+        actor_tag: string;
+        before: number;
+        after: number;
+        partitions: number;
+      }>;
+    }>(
+      `/api/harp-status/severity-reset-audit/compaction-audit?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.trigger ? `trigger=${encodeURIComponent(options.trigger)}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  getHarpSeverityResetCompactionAlerts: (
+    tail = 20,
+    options?: {
+      actorTag?: string;
+      since?: number;
+      limit?: number;
+      sort?: "newest" | "oldest";
+      cursor?: number;
+      cursorToken?: string;
+    },
+  ) =>
+    fetchJSON<{
+      alerts: Array<{
+        timestamp: number;
+        warnings: string[];
+        warning_details?: Array<{ code: string; severity: string }>;
+        rows: number;
+        partitions: number;
+        last_compact_ts: number;
+        high_severity?: boolean;
+        previous_warnings?: string[];
+      }>;
+      sort?: string;
+      limit?: number;
+      has_more?: boolean;
+      next_cursor?: number | null;
+      next_cursor_token?: string | null;
+    }>(
+      `/api/harp-status/severity-reset-audit/compaction-alerts?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+        options?.limit != null ? `limit=${encodeURIComponent(String(options.limit))}` : "",
+        options?.sort ? `sort=${encodeURIComponent(options.sort)}` : "",
+        options?.cursor != null ? `cursor=${encodeURIComponent(String(options.cursor))}` : "",
+        options?.cursorToken ? `cursor_token=${encodeURIComponent(options.cursorToken)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  verifyHarpSeverityResetExportPageDigest: (params: {
+    actorTag?: string;
+    stream: "alerts" | "webhook" | "unmute";
+    rowCount: number;
+    hasMore: boolean;
+    nextCursor?: number | null;
+    nextCursorToken?: string | null;
+    digest: string;
+    verifierId?: string;
+    nonce?: string;
+    issueReceipt?: boolean;
+  }) =>
+    fetchJSON<{
+      ok: boolean;
+      expected_digest: string;
+      provided_digest?: string | null;
+      duplicate_nonce?: boolean;
+      nonce_duplicate_count?: number;
+      nonce_duplicate_count_by_stream?: Record<string, number>;
+      receipt?: {
+        stream: string;
+        row_count: number;
+        has_more: boolean;
+        next_cursor?: number | null;
+        next_cursor_token?: string | null;
+        digest: string;
+        verified_at: string;
+        verifier_id?: string;
+        nonce?: string;
+        signature?: string;
+      } | null;
+    }>(
+      `/api/harp-status/severity-reset-audit/verify-export-page-digest?${[
+        params.actorTag ? `actor_tag=${encodeURIComponent(params.actorTag)}` : "",
+        `stream=${encodeURIComponent(params.stream)}`,
+        `row_count=${encodeURIComponent(String(params.rowCount))}`,
+        `has_more=${params.hasMore ? "true" : "false"}`,
+        params.nextCursor != null ? `next_cursor=${encodeURIComponent(String(params.nextCursor))}` : "",
+        params.nextCursorToken ? `next_cursor_token=${encodeURIComponent(params.nextCursorToken)}` : "",
+        `digest=${encodeURIComponent(params.digest)}`,
+        params.verifierId ? `verifier_id=${encodeURIComponent(params.verifierId)}` : "",
+        params.nonce ? `nonce=${encodeURIComponent(params.nonce)}` : "",
+        typeof params.issueReceipt === "boolean"
+          ? `issue_receipt=${params.issueReceipt ? "true" : "false"}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  getHarpSeverityResetVerifyAudit: (
+    tail = 20,
+    options?: {
+      actorTag?: string;
+      verifierId?: string;
+      since?: number;
+      limit?: number;
+      sort?: "newest" | "oldest";
+      sortBy?: "timestamp" | "actor_tag" | "reason";
+      cursor?: number;
+      cursorToken?: string;
+    },
+  ) =>
+    fetchJSON<{
+      audit: Array<{
+        timestamp: number;
+        actor_tag: string;
+        ok: boolean;
+        stream: string;
+        digest: string;
+        verifier_id?: string;
+        nonce?: string;
+      }>;
+      sort?: string;
+      limit?: number;
+      has_more?: boolean;
+      next_cursor?: number | null;
+      next_cursor_token?: string | null;
+      nonce_duplicate_count?: number;
+      nonce_duplicate_count_by_stream?: Record<string, number>;
+      active_verifier_locks?: Record<string, number>;
+      duplicate_heatmap?: Record<string, { last_10m: number; last_1h: number; last_24h: number }>;
+      lock_summary?: {
+        locked_verifier_count: number;
+        soonest_unlock_at?: number | null;
+        lock_entries_24h: number;
+        lock_entries_windows?: {
+          last_1h: number;
+          last_24h: number;
+          last_7d: number;
+        };
+        active_locks_alert?: boolean;
+        active_locks_threshold?: number;
+        active_locks_alert_dwell_seconds?: number;
+        active_locks_alert_dwell_severity?: "none" | "warn" | "critical" | string;
+      };
+      lock_notify_metrics?: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_rate: number;
+        p95_latency_ms?: number | null;
+        windows?: {
+          last_1h: {
+            attempted: number;
+            sent: number;
+            failed: number;
+            success_rate: number;
+            p95_latency_ms?: number | null;
+          };
+          last_24h: {
+            attempted: number;
+            sent: number;
+            failed: number;
+            success_rate: number;
+            p95_latency_ms?: number | null;
+          };
+        };
+      };
+    }>(
+      `/api/harp-status/severity-reset-audit/verify-audit?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.verifierId ? `verifier_id=${encodeURIComponent(options.verifierId)}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+        options?.limit != null ? `limit=${encodeURIComponent(String(options.limit))}` : "",
+        options?.sort ? `sort=${encodeURIComponent(options.sort)}` : "",
+        options?.sortBy ? `sort_by=${encodeURIComponent(options.sortBy)}` : "",
+        options?.cursor != null ? `cursor=${encodeURIComponent(String(options.cursor))}` : "",
+        options?.cursorToken ? `cursor_token=${encodeURIComponent(options.cursorToken)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  unlockHarpSeverityResetVerifier: (actorTag: string, verifierId: string, reason?: string) =>
+    fetchJSON<{ ok: boolean; was_locked: boolean; previous_locked_until?: number | null }>(
+      `/api/harp-status/severity-reset-audit/verify-verifier-unlock?${[
+        `actor_tag=${encodeURIComponent(actorTag)}`,
+        `verifier_id=${encodeURIComponent(verifierId)}`,
+        reason ? `reason=${encodeURIComponent(reason)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+      { method: "POST" },
+    ),
+  getHarpSeverityResetVerifyUnlockAudit: (
+    tail = 20,
+    options?: {
+      actorTag?: string;
+      verifierId?: string;
+      since?: number;
+      limit?: number;
+      sort?: "newest" | "oldest";
+      cursor?: number;
+      cursorToken?: string;
+      sent?: boolean;
+      minLatencyMs?: number;
+      errorContains?: string;
+    },
+  ) =>
+    fetchJSON<{
+      audit: Array<{
+        timestamp: number;
+        actor_tag: string;
+        verifier_id: string;
+        reason: string;
+        was_locked: boolean;
+        previous_locked_until?: number | null;
+      }>;
+      sort?: string;
+      limit?: number;
+      has_more?: boolean;
+      next_cursor?: number | null;
+      next_cursor_token?: string | null;
+    }>(
+      `/api/harp-status/severity-reset-audit/verify-verifier-unlock-audit?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.verifierId ? `verifier_id=${encodeURIComponent(options.verifierId)}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+        options?.limit != null ? `limit=${encodeURIComponent(String(options.limit))}` : "",
+        options?.sort ? `sort=${encodeURIComponent(options.sort)}` : "",
+        options?.cursor != null ? `cursor=${encodeURIComponent(String(options.cursor))}` : "",
+        options?.cursorToken ? `cursor_token=${encodeURIComponent(options.cursorToken)}` : "",
+        typeof options?.sent === "boolean" ? `sent=${options.sent ? "true" : "false"}` : "",
+        options?.minLatencyMs != null ? `min_latency_ms=${encodeURIComponent(String(options.minLatencyMs))}` : "",
+        options?.errorContains ? `error_contains=${encodeURIComponent(options.errorContains)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  getHarpSeverityResetVerifyLockAudit: (
+    tail = 20,
+    options?: {
+      actorTag?: string;
+      verifierId?: string;
+      action?: "locked" | "unlocked";
+      since?: number;
+      limit?: number;
+      sort?: "newest" | "oldest";
+      cursor?: number;
+      cursorToken?: string;
+    },
+  ) =>
+    fetchJSON<{
+      audit: Array<{
+        timestamp: number;
+        action: string;
+        verifier_id: string;
+        locked_until?: number | null;
+      }>;
+      sort?: string;
+      limit?: number;
+      has_more?: boolean;
+      next_cursor?: number | null;
+      next_cursor_token?: string | null;
+    }>(
+      `/api/harp-status/severity-reset-audit/verify-lock-audit?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.verifierId ? `verifier_id=${encodeURIComponent(options.verifierId)}` : "",
+        options?.action ? `action=${encodeURIComponent(options.action)}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+        options?.limit != null ? `limit=${encodeURIComponent(String(options.limit))}` : "",
+        options?.sort ? `sort=${encodeURIComponent(options.sort)}` : "",
+        options?.cursor != null ? `cursor=${encodeURIComponent(String(options.cursor))}` : "",
+        options?.cursorToken ? `cursor_token=${encodeURIComponent(options.cursorToken)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  getHarpSeverityResetVerifyLockAlerts: (
+    tail = 20,
+    options?: {
+      actorTag?: string;
+      active?: boolean;
+      since?: number;
+      limit?: number;
+      sort?: "newest" | "oldest";
+      cursor?: number;
+      cursorToken?: string;
+    },
+  ) =>
+    fetchJSON<{
+      alerts: Array<{
+        cursor_id?: string;
+        timestamp: number;
+        active: boolean;
+        locked_verifier_count: number;
+        threshold: number;
+      }>;
+      sort?: string;
+      limit?: number;
+      has_more?: boolean;
+      next_cursor?: number | null;
+      next_cursor_token?: string | null;
+      current_active?: boolean;
+      current_active_dwell_seconds?: number;
+      current_active_dwell_severity?: "none" | "warn" | "critical" | string;
+      threshold?: number;
+    }>(
+      `/api/harp-status/severity-reset-audit/verify-lock-alerts?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        typeof options?.active === "boolean" ? `active=${options.active ? "true" : "false"}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+        options?.limit != null ? `limit=${encodeURIComponent(String(options.limit))}` : "",
+        options?.sort ? `sort=${encodeURIComponent(options.sort)}` : "",
+        options?.cursor != null ? `cursor=${encodeURIComponent(String(options.cursor))}` : "",
+        options?.cursorToken ? `cursor_token=${encodeURIComponent(options.cursorToken)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  getHarpSeverityResetVerifyLockAlertsExport: async (params?: {
+    format?: "json" | "csv";
+    tail?: number;
+    limit?: number;
+    sort?: "newest" | "oldest";
+    cursor?: number;
+    cursorToken?: string;
+    actorTag?: string;
+    active?: boolean;
+    since?: number;
+  }) => {
+    const query = [
+      `format=${encodeURIComponent(params?.format ?? "json")}`,
+      `tail=${encodeURIComponent(String(params?.tail ?? 200))}`,
+      params?.limit != null ? `limit=${encodeURIComponent(String(params.limit))}` : "",
+      params?.sort ? `sort=${encodeURIComponent(params.sort)}` : "",
+      params?.cursor != null ? `cursor=${encodeURIComponent(String(params.cursor))}` : "",
+      params?.cursorToken ? `cursor_token=${encodeURIComponent(params.cursorToken)}` : "",
+      params?.actorTag ? `actor_tag=${encodeURIComponent(params.actorTag)}` : "",
+      typeof params?.active === "boolean" ? `active=${params.active ? "true" : "false"}` : "",
+      params?.since != null ? `since=${encodeURIComponent(String(params.since))}` : "",
+    ]
+      .filter(Boolean)
+      .join("&");
+    const resp = await authedFetch(`/api/harp-status/severity-reset-audit/verify-lock-alerts/export?${query}`);
+    if (!resp.ok) {
+      throw new Error(`Verify lock alerts export failed: HTTP ${resp.status}`);
+    }
+    if ((params?.format ?? "json") === "json") return { json: await resp.json(), headers: resp.headers };
+    return {
+      blob: await resp.blob(),
+      headers: resp.headers,
+      filename:
+        resp.headers.get("content-disposition")?.match(/filename="?([^";]+)"?/)?.[1] ??
+        "harp-verify-lock-alerts.csv",
+    };
+  },
+  getHarpSeverityResetVerifyLockBundleExport: async (format: "json" | "csv" = "json", tail = 200, actorTag?: string) => {
+    const resp = await authedFetch(
+      `/api/harp-status/severity-reset-audit/verify-lock-bundle/export?${[
+        `format=${encodeURIComponent(format)}`,
+        `tail=${encodeURIComponent(String(tail))}`,
+        actorTag ? `actor_tag=${encodeURIComponent(actorTag)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    );
+    if (!resp.ok) {
+      throw new Error(`Verify lock bundle export failed: HTTP ${resp.status}`);
+    }
+    if (format === "json") return { json: await resp.json(), headers: resp.headers };
+    return {
+      blob: await resp.blob(),
+      headers: resp.headers,
+      filename:
+        resp.headers.get("content-disposition")?.match(/filename="?([^";]+)"?/)?.[1] ??
+        "harp-verify-lock-bundle.csv",
+    };
+  },
+  getHarpSeverityResetCompactionExport: async (params?: {
+    stream?: "alerts" | "webhook" | "unmute" | "verify_unlock";
+    format?: "json" | "csv";
+    limit?: number;
+    sort?: "newest" | "oldest";
+    cursor?: number;
+    cursorToken?: string;
+    actorTag?: string;
+    verifierId?: string;
+    since?: number;
+    sent?: boolean;
+    minLatencyMs?: number;
+    errorContains?: string;
+  }) => {
+    const query = [
+      `stream=${encodeURIComponent(params?.stream ?? "alerts")}`,
+      `format=${encodeURIComponent(params?.format ?? "json")}`,
+      params?.limit != null ? `limit=${encodeURIComponent(String(params.limit))}` : "",
+      params?.sort ? `sort=${encodeURIComponent(params.sort)}` : "",
+      params?.cursor != null ? `cursor=${encodeURIComponent(String(params.cursor))}` : "",
+      params?.cursorToken ? `cursor_token=${encodeURIComponent(params.cursorToken)}` : "",
+      params?.actorTag ? `actor_tag=${encodeURIComponent(params.actorTag)}` : "",
+      params?.verifierId ? `verifier_id=${encodeURIComponent(params.verifierId)}` : "",
+      params?.since != null ? `since=${encodeURIComponent(String(params.since))}` : "",
+      typeof params?.sent === "boolean" ? `sent=${params.sent ? "true" : "false"}` : "",
+      params?.minLatencyMs != null ? `min_latency_ms=${encodeURIComponent(String(params.minLatencyMs))}` : "",
+      params?.errorContains ? `error_contains=${encodeURIComponent(params.errorContains)}` : "",
+    ]
+      .filter(Boolean)
+      .join("&");
+    const resp = await authedFetch(`/api/harp-status/severity-reset-audit/export?${query}`);
+    if (!resp.ok) {
+      throw new Error(`HARP compaction export failed: HTTP ${resp.status}`);
+    }
+    if ((params?.format ?? "json") === "json") {
+      return { json: await resp.json(), headers: resp.headers };
+    }
+    return {
+      blob: await resp.blob(),
+      headers: resp.headers,
+      filename:
+        resp.headers
+          .get("content-disposition")
+          ?.match(/filename="?([^";]+)"?/)?.[1] ?? `harp-compaction-${params?.stream ?? "alerts"}.csv`,
+    };
+  },
+  unmuteHarpSeverityResetWebhook: (actorTag?: string, reason?: string) =>
+    fetchJSON<{ ok: boolean; was_muted: boolean; previous_muted_until?: number | null }>(
+      `/api/harp-status/severity-reset-audit/webhook-unmute?${[
+        actorTag ? `actor_tag=${encodeURIComponent(actorTag)}` : "",
+        reason ? `reason=${encodeURIComponent(reason)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+      { method: "POST" },
+    ),
+  getHarpSeverityResetUnmuteAudit: (
+    tail = 20,
+    options?: {
+      actorTag?: string;
+      actor?: string;
+      since?: number;
+      limit?: number;
+      sort?: "newest" | "oldest";
+      sortBy?: "timestamp" | "actor_tag" | "reason";
+      cursor?: number;
+      cursorToken?: string;
+      wasMuted?: boolean;
+      reasonContains?: string;
+    },
+  ) =>
+    fetchJSON<{
+      audit: Array<{
+        timestamp: number;
+        actor_tag: string;
+        reason: string;
+        was_muted: boolean;
+        previous_muted_until?: number | null;
+      }>;
+      sort?: string;
+      limit?: number;
+      has_more?: boolean;
+      next_cursor?: number | null;
+      next_cursor_token?: string | null;
+    }>(
+      `/api/harp-status/severity-reset-audit/unmute-audit?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.actor ? `actor=${encodeURIComponent(options.actor)}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+        options?.limit != null ? `limit=${encodeURIComponent(String(options.limit))}` : "",
+        options?.sort ? `sort=${encodeURIComponent(options.sort)}` : "",
+        options?.sortBy ? `sort_by=${encodeURIComponent(options.sortBy)}` : "",
+        options?.cursor != null ? `cursor=${encodeURIComponent(String(options.cursor))}` : "",
+        options?.cursorToken ? `cursor_token=${encodeURIComponent(options.cursorToken)}` : "",
+        typeof options?.wasMuted === "boolean" ? `was_muted=${options.wasMuted ? "true" : "false"}` : "",
+        options?.reasonContains ? `reason_contains=${encodeURIComponent(options.reasonContains)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  getHarpSeverityResetCompactionWebhookAudit: (
+    tail = 20,
+    options?: {
+      actorTag?: string;
+      since?: number;
+      limit?: number;
+      sort?: "newest" | "oldest";
+      cursor?: number;
+      cursorToken?: string;
+      sent?: boolean;
+      minLatencyMs?: number;
+      errorContains?: string;
+    },
+  ) =>
+    fetchJSON<{
+      audit: Array<{
+        timestamp: number;
+        warnings: string[];
+        attempts: number;
+        sent: boolean;
+        last_error: string;
+        latency_ms?: number | null;
+      }>;
+      sort?: string;
+      limit?: number;
+      has_more?: boolean;
+      next_cursor?: number | null;
+      next_cursor_token?: string | null;
+    }>(
+      `/api/harp-status/severity-reset-audit/compaction-webhook-audit?${[
+        `tail=${encodeURIComponent(String(tail))}`,
+        options?.actorTag ? `actor_tag=${encodeURIComponent(options.actorTag)}` : "",
+        options?.since != null ? `since=${encodeURIComponent(String(options.since))}` : "",
+        options?.limit != null ? `limit=${encodeURIComponent(String(options.limit))}` : "",
+        options?.sort ? `sort=${encodeURIComponent(options.sort)}` : "",
+        options?.cursor != null ? `cursor=${encodeURIComponent(String(options.cursor))}` : "",
+        options?.cursorToken ? `cursor_token=${encodeURIComponent(options.cursorToken)}` : "",
+        typeof options?.sent === "boolean" ? `sent=${options.sent ? "true" : "false"}` : "",
+        options?.minLatencyMs != null ? `min_latency_ms=${encodeURIComponent(String(options.minLatencyMs))}` : "",
+        options?.errorContains ? `error_contains=${encodeURIComponent(options.errorContains)}` : "",
+      ]
+        .filter(Boolean)
+        .join("&")}`,
+    ),
+  resetHarpSeverityState: (severityStateKey?: string, actorTag?: string, reason?: string) =>
+    fetchJSON<{ ok: boolean; removed: number; scope: string; key?: string }>(
+      `/api/harp-status/severity-state/reset${
+        severityStateKey || actorTag || reason
+          ? `?${[
+              severityStateKey ? `severity_state_key=${encodeURIComponent(severityStateKey)}` : "",
+              actorTag ? `actor_tag=${encodeURIComponent(actorTag)}` : "",
+              reason ? `reason=${encodeURIComponent(reason)}` : "",
+            ]
+              .filter(Boolean)
+              .join("&")}`
+          : ""
+      }`,
+      { method: "POST" },
+    ),
+  getHarpOpsSnapshotExport: async (format: "json" | "csv" = "json", tail = 50) => {
+    const resp = await authedFetch(
+      `/api/harp-status/ops-snapshot/export?format=${encodeURIComponent(format)}&tail=${encodeURIComponent(String(tail))}`,
+    );
+    if (!resp.ok) {
+      throw new Error(`HARP ops snapshot export failed: HTTP ${resp.status}`);
+    }
+    return {
+      blob: await resp.blob(),
+      filename:
+        resp.headers
+          .get("content-disposition")
+          ?.match(/filename="?([^";]+)"?/)?.[1] ?? `harp-ops-snapshot.${format}`,
+    };
+  },
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *
@@ -1515,6 +2464,73 @@ export interface PlatformStatus {
   updated_at: string;
 }
 
+export interface HarpRoutingStatusSnapshot {
+  enabled?: boolean;
+  state?: string;
+  timestamp?: number;
+  provider?: string;
+  model?: string;
+  reason?: string;
+}
+
+export interface HarpRoutingStatusPayload {
+  status: HarpRoutingStatusSnapshot;
+  history_size: number;
+}
+
+export interface HarpRoutingAuditEvent {
+  severity: string;
+  message: string;
+  timestamp: number;
+  audit_id?: string;
+  channel_deliveries?: number;
+  webhook_status?: string;
+  webhook_attempts?: number;
+  webhook_error?: string;
+  webhook_signed?: boolean;
+}
+
+export interface HarpRoutingDecisionEvent {
+  state: string;
+  decision_id?: string;
+  provider?: string;
+  model?: string;
+  reason?: string;
+  session_key?: string;
+  timestamp: number;
+}
+
+export interface HarpStatusResponse {
+  enabled: boolean;
+  status: HarpRoutingStatusSnapshot;
+  history: HarpRoutingDecisionEvent[];
+  alerts: HarpRoutingAuditEvent[];
+  since?: number | null;
+  since_id?: string | null;
+  next_since_id?: string | null;
+  provider_failure_counts: Record<string, number>;
+  webhook_metrics?: {
+    attempted: number;
+    sent: number;
+    failed: number;
+    success_ratio: number;
+    windows?: {
+      last_1h: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_ratio: number;
+      };
+      last_24h: {
+        attempted: number;
+        sent: number;
+        failed: number;
+        success_ratio: number;
+      };
+    };
+  };
+}
+
 export interface StatusResponse {
   active_sessions: number;
   /** Phase 7: ``true`` when the dashboard's OAuth gate is engaged
@@ -1535,6 +2551,7 @@ export interface StatusResponse {
   gateway_running: boolean;
   gateway_state: string | null;
   gateway_updated_at: string | null;
+  harp_routing?: HarpRoutingStatusPayload;
   hermes_home: string;
   latest_config_version: number;
   release_date: string;
