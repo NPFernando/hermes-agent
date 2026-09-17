@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import hmac
 import inspect
+import json
 import logging
 import os
 import re
@@ -446,6 +448,23 @@ class GatewaySlashCommandsMixin:
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
+        harp_status = getattr(self, "_harp_routing_status", {}) or {}
+        if isinstance(harp_status, dict):
+            harp_state = str(harp_status.get("state") or "").strip()
+            if harp_state:
+                provider = str(harp_status.get("provider") or "").strip()
+                model = str(harp_status.get("model") or "").strip()
+                reason = str(harp_status.get("reason") or "").strip()
+                summary = f"HARP routing: {harp_state}"
+                if provider and model:
+                    summary += f" ({provider} · {model})"
+                elif provider:
+                    summary += f" ({provider})"
+                elif model:
+                    summary += f" ({model})"
+                if reason and harp_state in {"failed", "error"}:
+                    summary += f" — {reason}"
+                lines.append(summary)
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:
@@ -470,6 +489,333 @@ class GatewaySlashCommandsMixin:
         ])
 
         return "\n".join(lines)
+
+    async def _handle_harp_status_command(self, event: MessageEvent) -> str:
+        """Handle /harp-status command."""
+        from gateway.run import _load_gateway_config, _hermes_home
+
+        args = ""
+        try:
+            args = (event.get_command_args() if event else "") or ""
+            args = args.strip().lower()
+        except Exception:
+            args = ""
+        tail = 20
+        since_ts: float | None = None
+        since_id = ""
+        try:
+            m = re.search(r"(?:^|\s)--tail\s+(\d+)(?:\s|$)", args)
+            if m:
+                tail = max(1, int(m.group(1)))
+        except Exception:
+            tail = 20
+        try:
+            m = re.search(r"(?:^|\s)--since\s+([0-9]+(?:\.[0-9]+)?)(?:\s|$)", args)
+            if m:
+                since_ts = float(m.group(1))
+        except Exception:
+            since_ts = None
+        try:
+            m = re.search(r"(?:^|\s)--since-id\s+([A-Za-z0-9_-]+)(?:\s|$)", args)
+            if m:
+                since_id = str(m.group(1)).strip()
+        except Exception:
+            since_id = ""
+
+        if args in {"reset", "clear"} or args.startswith("reset ") or args.startswith("clear "):
+            self._harp_routing_status = {}
+            self._harp_routing_history = []
+            self._harp_routing_alert_history = []
+            try:
+                (_hermes_home / "harp-routing-status.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+            return "HARP status history reset."
+
+        try:
+            cfg = _load_gateway_config()
+        except Exception:
+            cfg = {}
+        harp_cfg = cfg.get("harp_routing", {}) if isinstance(cfg, dict) else {}
+        enabled = bool(harp_cfg.get("enabled")) if isinstance(harp_cfg, dict) else False
+
+        status = getattr(self, "_harp_routing_status", {}) or {}
+        history = list(getattr(self, "_harp_routing_history", []) or [])
+        alerts = list(getattr(self, "_harp_routing_alert_history", []) or [])
+        if since_ts is not None:
+            history = [row for row in history if float(row.get("timestamp") or 0.0) >= since_ts]
+            alerts = [row for row in alerts if float(row.get("timestamp") or 0.0) >= since_ts]
+        if since_id:
+            next_history = history
+            for idx, row in enumerate(history):
+                if str(row.get("decision_id") or "") == since_id:
+                    next_history = history[idx + 1 :]
+                    break
+            history = next_history
+            next_alerts = alerts
+            for idx, row in enumerate(alerts):
+                if str(row.get("audit_id") or "") == since_id:
+                    next_alerts = alerts[idx + 1 :]
+                    break
+            alerts = next_alerts
+        history_view = history[-tail:] if tail > 0 else history
+        alerts_view = alerts[-tail:] if tail > 0 else alerts
+
+        failure_counts: dict[str, int] = {}
+        for row in history:
+            if str(row.get("state") or "") != "failed":
+                continue
+            key = str(row.get("provider") or "unknown")
+            failure_counts[key] = failure_counts.get(key, 0) + 1
+
+        is_json = args == "json" or "--json" in args.split()
+        if is_json:
+            payload = {
+                "enabled": enabled,
+                "status": status if isinstance(status, dict) else {},
+                "history": history_view,
+                "alerts": alerts_view,
+                "since": since_ts,
+                "since_id": since_id or None,
+                "next_since_id": (
+                    str((alerts_view[-1] if alerts_view else {}).get("audit_id") or "")
+                    or str((history_view[-1] if history_view else {}).get("decision_id") or "")
+                    or None
+                ),
+                "provider_failure_counts": failure_counts,
+            }
+            return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+        lines = [
+            "**HARP routing status**",
+            f"Enabled: {'yes' if enabled else 'no'}",
+        ]
+        if isinstance(status, dict) and status.get("state"):
+            state = str(status.get("state") or "")
+            provider = str(status.get("provider") or "")
+            model = str(status.get("model") or "")
+            reason = str(status.get("reason") or "")
+            ts = float(status.get("timestamp") or 0.0)
+            when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts > 0 else "unknown"
+            lines.append(f"Last state: {state}")
+            if provider:
+                lines.append(f"Last provider: `{provider}`")
+            if model:
+                lines.append(f"Last model: `{model}`")
+            if reason:
+                lines.append(f"Last reason: {reason}")
+            lines.append(f"Last update: {when}")
+        else:
+            lines.append("Last state: unknown")
+
+        if history_view:
+            lines.append("")
+            lines.append("Recent decisions:")
+            for row in history_view[-5:]:
+                ts = float(row.get("timestamp") or 0.0)
+                when = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts > 0 else "--:--:--"
+                state = str(row.get("state") or "unknown")
+                provider = str(row.get("provider") or "")
+                model = str(row.get("model") or "")
+                reason = str(row.get("reason") or "")
+                detail = f"{provider}/{model}" if provider or model else "-"
+                line = f"- {when} · {state} · {detail}"
+                if reason and state in {"failed", "auto_disabled", "error"}:
+                    line += f" · {reason}"
+                lines.append(line)
+
+            if failure_counts:
+                lines.append("")
+                lines.append("Provider failure counters:")
+                for provider, count in sorted(
+                    failure_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                )[:5]:
+                    lines.append(f"- {provider}: {count}")
+
+        if alerts_view:
+            lines.append("")
+            lines.append("Recent alerts:")
+            for row in alerts_view[-3:]:
+                ts = float(row.get("timestamp") or 0.0)
+                when = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts > 0 else "--:--:--"
+                severity = str(row.get("severity") or "warning")
+                message = str(row.get("message") or "")
+                line = f"- {when} · {severity}"
+                if message:
+                    line += f" · {message}"
+                lines.append(line)
+
+        return "\n".join(lines)
+
+    async def _handle_harp_verify_command(self, event: MessageEvent) -> str:
+        """Handle /harp-verify command."""
+        raw_args = ""
+        try:
+            raw_args = (event.get_command_args() if event else "") or ""
+        except Exception:
+            raw_args = ""
+
+        try:
+            tokens = shlex.split(raw_args)
+        except Exception:
+            msg = (
+                "Usage: /harp-verify --body '<raw-json>' --signature 'sha256=...' --secret '<key>' "
+                "[--body-file /path] [--signature-file /path] [--headers-file /path.json] [--strict] [--json] [--json-schema]"
+            )
+            return msg
+        strict_mode = "--strict" in tokens
+        output_json = "--json" in tokens
+        output_json_schema = "--json-schema" in tokens
+
+        parsed: dict[str, str] = {}
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in {"--strict", "--json"}:
+                parsed[tok] = "true"
+                i += 1
+                continue
+            if tok.startswith("--") and i + 1 < len(tokens):
+                parsed[tok] = tokens[i + 1]
+                i += 2
+                continue
+            i += 1
+
+        body = parsed.get("--body", "")
+        signature = parsed.get("--signature", "")
+        body_file = parsed.get("--body-file", "")
+        signature_file = parsed.get("--signature-file", "")
+        headers_file = parsed.get("--headers-file", "")
+        nonce_cache_file = parsed.get("--nonce-cache-file", "")
+        now_override = parsed.get("--now", "")
+        secret = parsed.get("--secret", "")
+        secret_env = parsed.get("--secret-env", "")
+        if not secret and secret_env:
+            secret = os.getenv(secret_env, "")
+        if not body and body_file:
+            try:
+                body = Path(body_file).read_text(encoding="utf-8")
+            except Exception as exc:
+                return json.dumps({"ok": False, "error": f"Failed reading --body-file: {exc}"}) if output_json else f"Failed reading --body-file: {exc}"
+        if not signature and signature_file:
+            try:
+                signature = Path(signature_file).read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                return json.dumps({"ok": False, "error": f"Failed reading --signature-file: {exc}"}) if output_json else f"Failed reading --signature-file: {exc}"
+        if not signature and headers_file:
+            try:
+                hdr_obj = json.loads(Path(headers_file).read_text(encoding="utf-8"))
+                if isinstance(hdr_obj, dict):
+                    signature = str(
+                        hdr_obj.get("X-HARP-Signature")
+                        or hdr_obj.get("x-harp-signature")
+                        or ""
+                    ).strip()
+            except Exception as exc:
+                return json.dumps({"ok": False, "error": f"Failed reading --headers-file: {exc}"}) if output_json else f"Failed reading --headers-file: {exc}"
+
+        if not body or not signature or not secret:
+            msg = (
+                "Usage: /harp-verify --body '<raw-json>' --signature 'sha256=...' "
+                "--secret '<key>' [--secret-env ENV_NAME] "
+                "[--body-file /path] [--signature-file /path] [--headers-file /path.json] [--strict] [--json] [--json-schema]"
+            )
+            return json.dumps({"ok": False, "error": msg}) if output_json else msg
+        if not signature.startswith("sha256="):
+            msg = "Invalid signature format. Expected: sha256=<hex>"
+            return json.dumps({"ok": False, "error": msg}) if output_json else msg
+
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        expected = "sha256=" + hmac.new(
+            secret.encode("utf-8"),
+            body.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        ok = hmac.compare_digest(signature, expected)
+        strict_note = "disabled"
+        if ok and strict_mode:
+            try:
+                payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    msg = "Strict verify failed: body is not a JSON object."
+                    return json.dumps({"ok": False, "error": msg}) if output_json else msg
+                nonce = str(payload.get("nonce") or "").strip()
+                sent_at = str(payload.get("sent_at") or "").strip()
+                max_skew = int(payload.get("max_skew_seconds") or 300)
+                if max_skew < 1:
+                    max_skew = 1
+                now_ts = float(now_override) if now_override else time.time()
+                if not nonce or not sent_at:
+                    msg = "Strict verify failed: nonce/sent_at missing from payload."
+                    return json.dumps({"ok": False, "error": msg}) if output_json else msg
+                sent_dt = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
+                sent_ts = sent_dt.timestamp()
+                skew = abs(now_ts - sent_ts)
+                if skew > max_skew:
+                    msg = f"Strict verify failed: skew {skew:.1f}s exceeds max_skew_seconds={max_skew}."
+                    return json.dumps({"ok": False, "error": msg}) if output_json else msg
+                cache_path = Path(nonce_cache_file) if nonce_cache_file else Path.home() / ".hermes" / "harp-verify-nonces.json"
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_data: dict[str, float] = {}
+                if cache_path.exists():
+                    try:
+                        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+                        if isinstance(raw, dict):
+                            cache_data = {str(k): float(v) for k, v in raw.items()}
+                    except Exception:
+                        cache_data = {}
+                # Keep a 7-day nonce horizon.
+                cutoff = now_ts - 604800
+                cache_data = {k: v for k, v in cache_data.items() if v >= cutoff}
+                if nonce in cache_data:
+                    msg = "Strict verify failed: nonce replay detected."
+                    return json.dumps({"ok": False, "error": msg}) if output_json else msg
+                cache_data[nonce] = now_ts
+                cache_path.write_text(json.dumps(cache_data, separators=(",", ":")), encoding="utf-8")
+                strict_note = "passed"
+            except Exception as exc:
+                msg = f"Strict verify failed: {exc}"
+                return json.dumps({"ok": False, "error": msg}) if output_json else msg
+        if output_json:
+            return json.dumps(
+                {
+                    "ok": True,
+                    "valid": bool(ok),
+                    "strict": strict_note,
+                    "body_sha256": digest,
+                    "expected_signature": expected,
+                    "schema_id": "harp.verify.result.v1",
+                    "changelog_url": "https://github.com/outsourc-e/hermes-agent/blob/main/website/docs/user-guide/features/provider-routing.md",
+                    "schema_version": "1.0",
+                    "schema": (
+                        {
+                            "type": "object",
+                            "required": ["ok", "valid", "strict", "body_sha256", "expected_signature", "schema_version"],
+                            "properties": {
+                                "ok": {"type": "boolean"},
+                                "valid": {"type": "boolean"},
+                                "strict": {"type": "string"},
+                                "body_sha256": {"type": "string"},
+                                "expected_signature": {"type": "string"},
+                                "schema_version": {"type": "string"},
+                            },
+                        }
+                        if output_json_schema
+                        else None
+                    ),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        return "\n".join(
+            [
+                "**HARP verify**",
+                f"Valid: {'yes' if ok else 'no'}",
+                f"Strict: {strict_note}",
+                f"Body SHA256: `{digest}`",
+                f"Expected signature: `{expected}`",
+            ]
+        )
 
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
